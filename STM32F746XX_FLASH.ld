@@ -55,12 +55,13 @@ ENTRY(Reset_Handler)
 /* Specify the memory areas */
 MEMORY
 {
-RAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 320K
-FLASH (rx)      : ORIGIN = 0x8000000, LENGTH = 1024K
+DTCM (xrw)     : ORIGIN = 0x20000000, LENGTH = 64K
+SRAM (xrw)     : ORIGIN = 0x20010000, LENGTH = 256K
+FLASH (rx)     : ORIGIN = 0x8000000, LENGTH = 1024K
 }
 
 /* Highest address of the user mode stack */
-_estack = ORIGIN(RAM) + LENGTH(RAM);    /* end of RAM */
+_estack = ORIGIN(SRAM) + LENGTH(SRAM);    /* end of SRAM */
 _sstack = _estack - _Min_Stack_Size;
 /* Generate a link error if heap and stack don't fit into RAM */
 _Min_Heap_Size = 0x200;      /* required amount of heap  */
@@ -148,6 +149,14 @@ SECTIONS
     . = ALIGN(4);
   } >FLASH
 
+  /* Audio DMA buffers in DTCM (non-cacheable, no cache maintenance needed) */
+  .audio_buffers (NOLOAD) :
+  {
+    . = ALIGN(4);
+    *(.audio_buffers)
+    . = ALIGN(4);
+  } >DTCM
+
   /* used by the startup to initialize data */
   _sidata = LOADADDR(.data);
 
@@ -162,7 +171,7 @@ SECTIONS
     *(.RamFunc*)       /* .RamFunc* sections */
 
     . = ALIGN(4);
-  } >RAM AT> FLASH
+  } >SRAM AT> FLASH
 
  /* Initialized TLS data section */
   .tdata : ALIGN(4)
@@ -172,7 +181,7 @@ SECTIONS
     _edata = .;        /* define a global symbol at data end */
     PROVIDE(__data_end = .);
     PROVIDE(__tdata_end = .);
-  } >RAM AT> FLASH
+  } >SRAM AT> FLASH
 
   PROVIDE( __tdata_start = ADDR(.tdata) );
   PROVIDE( __tdata_size = __tdata_end - __tdata_start );
@@ -196,7 +205,7 @@ SECTIONS
     *(.tbss .tbss.*)
     . = ALIGN(4);
     PROVIDE( __tbss_end = . );
-  } >RAM
+  } >SRAM
 
   PROVIDE( __tbss_start = ADDR(.tbss) );
   PROVIDE( __tbss_size = __tbss_end - __tbss_start );
@@ -220,7 +229,7 @@ SECTIONS
     _ebss = .;         /* define a global symbol at bss end */
     __bss_end__ = _ebss;
       PROVIDE( __bss_end = .);
-  } >RAM
+  } >SRAM
   PROVIDE( __non_tls_bss_start = ADDR(.bss) );
 
   PROVIDE( __bss_start = __tbss_start );
@@ -235,7 +244,7 @@ SECTIONS
     . = . + _Min_Heap_Size;
     . = . + _Min_Stack_Size;
     . = ALIGN(8);
-  } >RAM
+  } >SRAM
 
 
 
