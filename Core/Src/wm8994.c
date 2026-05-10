@@ -3,28 +3,13 @@
 
 static I2C_HandleTypeDef *codec_i2c;
 
-volatile uint32_t wm8994_write_ok_count = 0;
-volatile uint32_t wm8994_write_fail_count = 0;
-volatile uint16_t wm8994_first_fail_reg = 0;
-volatile HAL_StatusTypeDef wm8994_first_fail_status = HAL_OK;
-
 HAL_StatusTypeDef wm8994_write_reg(uint16_t reg, uint16_t value)
 {
     uint8_t data[2];
     data[0] = (value >> 8) & 0xFF;
     data[1] = value & 0xFF;
-    HAL_StatusTypeDef status = HAL_I2C_Mem_Write(codec_i2c, WM8994_I2C_ADDR, reg,
+    return HAL_I2C_Mem_Write(codec_i2c, WM8994_I2C_ADDR, reg,
                              I2C_MEMADD_SIZE_16BIT, data, 2, 100);
-    if (status == HAL_OK) {
-        wm8994_write_ok_count++;
-    } else {
-        if (wm8994_write_fail_count == 0) {
-            wm8994_first_fail_reg = reg;
-            wm8994_first_fail_status = status;
-        }
-        wm8994_write_fail_count++;
-    }
-    return status;
 }
 
 HAL_StatusTypeDef wm8994_read_reg(uint16_t reg, uint16_t *value)
@@ -133,7 +118,7 @@ void wm8994_set_headphone_volume(uint8_t volume)
 {
     if (volume > 63)
         volume = 63;
-    uint16_t val = 0x0100 | volume;
+    uint16_t val = 0x0140 | volume;
     wm8994_write_reg(0x001C, val);
     wm8994_write_reg(0x001D, val);
 }
