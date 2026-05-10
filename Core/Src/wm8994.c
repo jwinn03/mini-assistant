@@ -85,7 +85,6 @@ HAL_StatusTypeDef wm8994_init(I2C_HandleTypeDef *hi2c)
     wm8994_write_reg(0x0029, 0x0035);  /* Left input mixer: IN1L to MIXINL */
     wm8994_write_reg(0x002A, 0x0035);  /* Right input mixer: IN1R to MIXINR */
     wm8994_write_reg(0x0004, 0x0303);  /* AIF1ADC1L/R enable */
-    wm8994_write_reg(0x0440, 0x00DB);  /* AIF1 DRC1 */
     wm8994_write_reg(0x0002, 0x6350);  /* IN1L/R enable, MIXINL/R enable, thermal */
     wm8994_write_reg(0x0606, 0x0002);  /* ADC1L -> AIF1 timeslot 0 left */
     wm8994_write_reg(0x0607, 0x0002);  /* ADC1R -> AIF1 timeslot 0 right */
@@ -127,8 +126,8 @@ HAL_StatusTypeDef wm8994_init(I2C_HandleTypeDef *hi2c)
     wm8994_write_reg(0x0401, 0x01C0);  /* AIF1 ADC1R 0 dB */
     wm8994_write_reg(0x0410, 0x1800);  /* ADC HPF */
 
-    wm8994_write_reg(0x001C, 0x017F);  /* HP left volume max, VU */
-    wm8994_write_reg(0x001D, 0x017F);  /* HP right volume max, VU */
+    wm8994_write_reg(0x001C, 0x0179);  /* HP left volume, VU, unmute */
+    wm8994_write_reg(0x001D, 0x0179);  /* HP right volume, VU, unmute */
 
     return HAL_OK;
 }
