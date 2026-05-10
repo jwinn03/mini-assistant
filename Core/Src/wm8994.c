@@ -126,8 +126,8 @@ HAL_StatusTypeDef wm8994_init(I2C_HandleTypeDef *hi2c)
     wm8994_write_reg(0x0401, 0x01C0);  /* AIF1 ADC1R 0 dB */
     wm8994_write_reg(0x0410, 0x1800);  /* ADC HPF */
 
-    wm8994_write_reg(0x001C, 0x0179);  /* HP left volume, VU, unmute */
-    wm8994_write_reg(0x001D, 0x0179);  /* HP right volume, VU, unmute */
+    wm8994_write_reg(0x001C, 0x017F);  /* HP left volume max, VU, unmute */
+    wm8994_write_reg(0x001D, 0x017F);  /* HP right volume max, VU, unmute */
 
     return HAL_OK;
 }
