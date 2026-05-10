@@ -56,8 +56,9 @@ HAL_StatusTypeDef wm8994_init(I2C_HandleTypeDef *hi2c)
     /* Anti-pop */
     wm8994_write_reg(0x0039, 0x006C);
 
-    /* Power Management 1: VMID_SEL=01 (2x50k), BIAS_ENA=1 */
-    wm8994_write_reg(0x0001, 0x0003);
+    /* Power Management 1: VMID_SEL=01 (2x50k), BIAS_ENA=1, MICB1_ENA=1
+       MICBIAS1 powers the DMIC interface voltage domain (datasheet §4.7) */
+    wm8994_write_reg(0x0001, 0x0013);
     osDelay(50);
 
     /* ---- Clocking: MCLK-direct mode ---- */
@@ -66,12 +67,12 @@ HAL_StatusTypeDef wm8994_init(I2C_HandleTypeDef *hi2c)
     wm8994_write_reg(0x0208, 0x000A);  /* AIF1DSPCLK_ENA, SYSDSPCLK_ENA */
     wm8994_write_reg(0x0210, 0x0083);  /* AIF1_SR=48kHz */
 
-    /* ---- AIF1: I2S, 16-bit, codec is slave ---- */
+    /* ---- AIF1: DSP mode for 4-slot TDM, 16-bit, codec is slave ---- */
 
-    wm8994_write_reg(0x0300, 0x4010);  /* AIF1_FMT=I2S, AIF1_WL=16-bit */
+    wm8994_write_reg(0x0300, 0x4018);  /* AIF1_FMT=DSP, AIF1_WL=16-bit */
     wm8994_write_reg(0x0302, 0x0000);  /* AIF1_MSTR=0 (slave) */
 
-    /* ---- Output path: AIF1 -> DAC1 -> Output Mixer -> Headphones ---- */
+    /* ---- Output path: AIF1 timeslot 0 -> DAC1 -> Headphones ---- */
 
     wm8994_write_reg(0x0005, 0x0303);  /* AIF1DAC1L/R enable, DAC1L/R enable */
     wm8994_write_reg(0x0601, 0x0001);  /* AIF1 timeslot 0 -> DAC1L */
@@ -79,21 +80,19 @@ HAL_StatusTypeDef wm8994_init(I2C_HandleTypeDef *hi2c)
     wm8994_write_reg(0x0604, 0x0000);  /* Clear DAC2L mixer */
     wm8994_write_reg(0x0605, 0x0000);  /* Clear DAC2R mixer */
 
-    /* ---- Input path: Line in (IN1L/IN1R) -> ADC -> AIF1 ---- */
+    /* ---- Input path: DMIC2 (onboard MEMS U20/U21) -> ADC2 -> AIF1 timeslot 1 ---- */
 
-    wm8994_write_reg(0x0028, 0x0011);  /* Input mixer: IN1LN->IN1L, IN1RN->IN1R */
-    wm8994_write_reg(0x0029, 0x0035);  /* Left input mixer: IN1L to MIXINL */
-    wm8994_write_reg(0x002A, 0x0035);  /* Right input mixer: IN1R to MIXINR */
-    wm8994_write_reg(0x0004, 0x0303);  /* AIF1ADC1L/R enable */
-    wm8994_write_reg(0x0002, 0x6350);  /* IN1L/R enable, MIXINL/R enable, thermal */
-    wm8994_write_reg(0x0606, 0x0002);  /* ADC1L -> AIF1 timeslot 0 left */
-    wm8994_write_reg(0x0607, 0x0002);  /* ADC1R -> AIF1 timeslot 0 right */
-    wm8994_write_reg(0x0700, 0x800D);  /* GPIO1 */
+    wm8994_write_reg(0x0004, 0x0C30);  /* AIF1ADC2L/R enable, DMIC2L/R enable */
+    wm8994_write_reg(0x0450, 0x00DB);  /* AIF1 DRC2 */
+    wm8994_write_reg(0x0002, 0x6000);  /* Thermal sensor only, no analog inputs */
+    wm8994_write_reg(0x0608, 0x0002);  /* ADC2L -> AIF1 timeslot 1 left */
+    wm8994_write_reg(0x0609, 0x0002);  /* ADC2R -> AIF1 timeslot 1 right */
+    wm8994_write_reg(0x0700, 0x000D);  /* GPIO1 for DMIC */
 
     /* ---- Output mixer & power ---- */
 
     wm8994_write_reg(0x0003, 0x0330);  /* MIXOUTL/R enable */
-    wm8994_write_reg(0x0001, 0x0303);  /* VMID, BIAS, HPOUT1L/R enable */
+    wm8994_write_reg(0x0001, 0x0313);  /* VMID, BIAS, MICB1, HPOUT1L/R enable */
     wm8994_write_reg(0x002D, 0x0001);  /* DAC1L -> output mixer left */
     wm8994_write_reg(0x002E, 0x0001);  /* DAC1R -> output mixer right */
 
@@ -118,13 +117,11 @@ HAL_StatusTypeDef wm8994_init(I2C_HandleTypeDef *hi2c)
     wm8994_write_reg(0x0403, 0x01C0);  /* AIF1 DAC1R 0 dB */
     wm8994_write_reg(0x0420, 0x0000);  /* Unmute DAC1 */
 
-    /* ---- Input volume & HPF ---- */
+    /* ---- ADC2 digital volume & HPF ---- */
 
-    wm8994_write_reg(0x0018, 0x000B);  /* IN1L volume 0 dB, unmute */
-    wm8994_write_reg(0x001A, 0x000B);  /* IN1R volume 0 dB, unmute */
-    wm8994_write_reg(0x0400, 0x01C0);  /* AIF1 ADC1L 0 dB */
-    wm8994_write_reg(0x0401, 0x01C0);  /* AIF1 ADC1R 0 dB */
-    wm8994_write_reg(0x0410, 0x1800);  /* ADC HPF */
+    wm8994_write_reg(0x0500, 0x01C0);  /* AIF1 ADC2L 0 dB */
+    wm8994_write_reg(0x0501, 0x01C0);  /* AIF1 ADC2R 0 dB */
+    wm8994_write_reg(0x0418, 0x1800);  /* ADC2 HPF */
 
     wm8994_write_reg(0x001C, 0x017F);  /* HP left volume max, VU, unmute */
     wm8994_write_reg(0x001D, 0x017F);  /* HP right volume max, VU, unmute */

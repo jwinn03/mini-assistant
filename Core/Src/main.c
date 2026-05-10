@@ -859,7 +859,7 @@ static void MX_SAI2_Init(void)
   hsai_BlockA2.Init.AudioMode = SAI_MODEMASTER_TX;
   hsai_BlockA2.Init.DataSize = SAI_DATASIZE_16;
   hsai_BlockA2.Init.FirstBit = SAI_FIRSTBIT_MSB;
-  hsai_BlockA2.Init.ClockStrobing = SAI_CLOCKSTROBING_FALLINGEDGE;
+  hsai_BlockA2.Init.ClockStrobing = SAI_CLOCKSTROBING_RISINGEDGE;
   hsai_BlockA2.Init.Synchro = SAI_ASYNCHRONOUS;
   hsai_BlockA2.Init.OutputDrive = SAI_OUTPUTDRIVE_DISABLE;
   hsai_BlockA2.Init.NoDivider = SAI_MASTERDIVIDER_ENABLE;
@@ -869,14 +869,14 @@ static void MX_SAI2_Init(void)
   hsai_BlockA2.Init.MonoStereoMode = SAI_STEREOMODE;
   hsai_BlockA2.Init.CompandingMode = SAI_NOCOMPANDING;
   hsai_BlockA2.Init.TriState = SAI_OUTPUT_NOTRELEASED;
-  hsai_BlockA2.FrameInit.FrameLength = 32;
-  hsai_BlockA2.FrameInit.ActiveFrameLength = 16;
+  hsai_BlockA2.FrameInit.FrameLength = 64;
+  hsai_BlockA2.FrameInit.ActiveFrameLength = 32;
   hsai_BlockA2.FrameInit.FSDefinition = SAI_FS_CHANNEL_IDENTIFICATION;
   hsai_BlockA2.FrameInit.FSPolarity = SAI_FS_ACTIVE_LOW;
   hsai_BlockA2.FrameInit.FSOffset = SAI_FS_BEFOREFIRSTBIT;
   hsai_BlockA2.SlotInit.FirstBitOffset = 0;
-  hsai_BlockA2.SlotInit.SlotSize = SAI_SLOTSIZE_DATASIZE;
-  hsai_BlockA2.SlotInit.SlotNumber = 2;
+  hsai_BlockA2.SlotInit.SlotSize = SAI_SLOTSIZE_16B;
+  hsai_BlockA2.SlotInit.SlotNumber = 4;
   hsai_BlockA2.SlotInit.SlotActive = 0x00000003;
   if (HAL_SAI_Init(&hsai_BlockA2) != HAL_OK)
   {
@@ -887,7 +887,7 @@ static void MX_SAI2_Init(void)
   hsai_BlockB2.Init.AudioMode = SAI_MODESLAVE_RX;
   hsai_BlockB2.Init.DataSize = SAI_DATASIZE_16;
   hsai_BlockB2.Init.FirstBit = SAI_FIRSTBIT_MSB;
-  hsai_BlockB2.Init.ClockStrobing = SAI_CLOCKSTROBING_FALLINGEDGE;
+  hsai_BlockB2.Init.ClockStrobing = SAI_CLOCKSTROBING_RISINGEDGE;
   hsai_BlockB2.Init.Synchro = SAI_SYNCHRONOUS;
   hsai_BlockB2.Init.OutputDrive = SAI_OUTPUTDRIVE_DISABLE;
   hsai_BlockB2.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
@@ -895,15 +895,15 @@ static void MX_SAI2_Init(void)
   hsai_BlockB2.Init.MonoStereoMode = SAI_STEREOMODE;
   hsai_BlockB2.Init.CompandingMode = SAI_NOCOMPANDING;
   hsai_BlockB2.Init.TriState = SAI_OUTPUT_NOTRELEASED;
-  hsai_BlockB2.FrameInit.FrameLength = 32;
-  hsai_BlockB2.FrameInit.ActiveFrameLength = 16;
+  hsai_BlockB2.FrameInit.FrameLength = 64;
+  hsai_BlockB2.FrameInit.ActiveFrameLength = 32;
   hsai_BlockB2.FrameInit.FSDefinition = SAI_FS_CHANNEL_IDENTIFICATION;
   hsai_BlockB2.FrameInit.FSPolarity = SAI_FS_ACTIVE_LOW;
   hsai_BlockB2.FrameInit.FSOffset = SAI_FS_BEFOREFIRSTBIT;
   hsai_BlockB2.SlotInit.FirstBitOffset = 0;
-  hsai_BlockB2.SlotInit.SlotSize = SAI_SLOTSIZE_DATASIZE;
-  hsai_BlockB2.SlotInit.SlotNumber = 2;
-  hsai_BlockB2.SlotInit.SlotActive = 0x00000003;
+  hsai_BlockB2.SlotInit.SlotSize = SAI_SLOTSIZE_16B;
+  hsai_BlockB2.SlotInit.SlotNumber = 4;
+  hsai_BlockB2.SlotInit.SlotActive = 0x0000000C;
   if (HAL_SAI_Init(&hsai_BlockB2) != HAL_OK)
   {
     Error_Handler();

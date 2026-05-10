@@ -28,8 +28,6 @@ volatile uint32_t audio_debug_sai_a_sr = 0;
 volatile uint32_t audio_debug_sai_b_cr1 = 0;
 volatile uint32_t audio_debug_sai_b_sr = 0;
 volatile int16_t audio_debug_rx_pattern = 0;
-volatile uint32_t audio_debug_pg10_high = 0;
-volatile uint32_t audio_debug_pg10_total = 10000;
 
 static int16_t audio_rx_buffer[AUDIO_DMA_SAMPLES] __attribute__((section(".audio_buffers")));
 static int16_t audio_tx_buffer[AUDIO_DMA_SAMPLES] __attribute__((section(".audio_buffers")));
@@ -102,6 +100,17 @@ void audio_init(void)
                 configMAX_PRIORITIES - 1, &audio_task_handle);
     audio_debug_stage = 1;
 
+    /* WM8994 DSP mode triggers on LRCLK rising edge (datasheet Fig.60).
+       With FS_ACTIVE_LOW the rising edge falls at the SAI frame midpoint,
+       rotating the slot mapping by 2:
+         WM8994 timeslot 0 (DAC) = SAI slots 2,3
+         WM8994 timeslot 1 (DMIC2) = SAI slots 0,1
+       Swap the CubeMX-configured masks before DMA starts. */
+    SAI2_Block_A->SLOTR = (SAI2_Block_A->SLOTR & ~SAI_xSLOTR_SLOTEN_Msk)
+                          | (0xCU << SAI_xSLOTR_SLOTEN_Pos);
+    SAI2_Block_B->SLOTR = (SAI2_Block_B->SLOTR & ~SAI_xSLOTR_SLOTEN_Msk)
+                          | (0x3U << SAI_xSLOTR_SLOTEN_Pos);
+
     /* RM0385 §30.4.7: synchronous slave must be enabled BEFORE the master.
        Block B (sync slave RX) waits idle until Block A starts generating clocks. */
     audio_debug_rx_status = HAL_SAI_Receive_DMA(
@@ -140,30 +149,6 @@ void audio_init(void)
     audio_debug_sai_a_sr  = SAI2_Block_A->SR;
     audio_debug_sai_b_cr1 = SAI2_Block_B->CR1;
     audio_debug_sai_b_sr  = SAI2_Block_B->SR;
-
-    /* Temporarily switch PG10 to plain GPIO input with pull-up to test
-       whether the WM8994 ADCDAT is physically connected.
-       If result ~10000: pin floats high = not connected.
-       If result ~0: something drives it low.
-       If result ~3000-7000: ADCDAT is toggling = connected. */
-    {
-        GPIO_InitTypeDef gpio_test = {0};
-        gpio_test.Pin = GPIO_PIN_10;
-        gpio_test.Mode = GPIO_MODE_INPUT;
-        gpio_test.Pull = GPIO_PULLUP;
-        HAL_GPIO_Init(GPIOG, &gpio_test);
-        vTaskDelay(pdMS_TO_TICKS(5));
-
-        audio_debug_pg10_high = 0;
-        for (uint32_t i = 0; i < audio_debug_pg10_total; i++)
-            audio_debug_pg10_high += (GPIOG->IDR >> 10) & 1;
-
-        gpio_test.Mode = GPIO_MODE_AF_PP;
-        gpio_test.Pull = GPIO_NOPULL;
-        gpio_test.Speed = GPIO_SPEED_FREQ_LOW;
-        gpio_test.Alternate = GPIO_AF10_SAI2;
-        HAL_GPIO_Init(GPIOG, &gpio_test);
-    }
 
     audio_debug_stage = 5;
 }
