@@ -1,5 +1,5 @@
 #include "wm8994.h"
-#include "cmsis_os.h"
+//#include "cmsis_os.h" // Only for osDelay - could just stick to pure FreeRTOS API if desired
 
 static I2C_HandleTypeDef *codec_i2c;
 
@@ -31,7 +31,7 @@ HAL_StatusTypeDef wm8994_init(I2C_HandleTypeDef *hi2c)
     /* Software reset */
     status = wm8994_write_reg(0x0000, 0x0000);
     if (status != HAL_OK) return status;
-    osDelay(50);
+    //osDelay(50); //or vTaskDelay(pdMS_TO_TICKS(50));
 
     /* Errata workarounds */
     wm8994_write_reg(0x0102, 0x0003);
@@ -44,7 +44,7 @@ HAL_StatusTypeDef wm8994_init(I2C_HandleTypeDef *hi2c)
     /* Power Management 1: VMID_SEL=01 (2x50k), BIAS_ENA=1, MICB1_ENA=1
        MICBIAS1 powers the DMIC interface voltage domain (datasheet §4.7) */
     wm8994_write_reg(0x0001, 0x0013);
-    osDelay(50);
+    //osDelay(50);
 
     /* ---- Clocking: MCLK-direct mode ---- */
 
@@ -85,11 +85,11 @@ HAL_StatusTypeDef wm8994_init(I2C_HandleTypeDef *hi2c)
 
     wm8994_write_reg(0x0051, 0x0005);  /* Class W envelope tracking */
     wm8994_write_reg(0x004C, 0x9F25);  /* Charge pump enable */
-    osDelay(15);
+    //osDelay(15);
 
     wm8994_write_reg(0x0054, 0x0033);  /* DC servo enable */
     wm8994_write_reg(0x0060, 0x0022);  /* HP intermediate stage */
-    osDelay(300);
+    //osDelay(300);
 
     wm8994_write_reg(0x0060, 0x00EE);  /* HP output stage */
     wm8994_write_reg(0x0060, 0x00FF);  /* HP remove short */
