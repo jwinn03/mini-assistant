@@ -46,16 +46,26 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/wm8994.c
     Core/Src/audio.c
+    Core/Src/dsp.c
 )
+
+# CMSIS-DSP — vendored source under Middlewares/Third_Party/CMSIS-DSP
+# Globs every .c under Source/; --gc-sections drops unused functions at link time.
+file(GLOB_RECURSE CMSIS_DSP_SRC
+    ${CMAKE_CURRENT_SOURCE_DIR}/Middlewares/Third_Party/CMSIS-DSP/Source/*.c
+)
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE ${CMSIS_DSP_SRC})
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
-    # Add user defined include paths
+    Middlewares/Third_Party/CMSIS-DSP/Include
+    Middlewares/Third_Party/CMSIS-DSP/PrivateInclude
 )
 
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
-    # Add user defined symbols
+    ARM_MATH_CM7
+    __FPU_PRESENT=1
 )
 
 # Remove wrong libob.a library dependency when using cpp files

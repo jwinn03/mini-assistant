@@ -1,5 +1,6 @@
 #include "audio.h"
 #include "wm8994.h"
+#include "dsp.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include <string.h>
@@ -34,7 +35,11 @@ static void audio_task(void *argument)
             dst = &audio_tx_buffer[AUDIO_HALF_SAMPLES];
         }
 
-        memcpy(dst, src, AUDIO_HALF_SAMPLES * sizeof(int16_t));
+        uint32_t t0 = DWT->CYCCNT;
+        process_audio(src, dst, AUDIO_HALF_SAMPLES);
+        uint32_t cycles = DWT->CYCCNT - t0;
+        dsp_cycles_last = cycles;
+        if (cycles > dsp_cycles_max) dsp_cycles_max = cycles;
     }
 }
 
@@ -58,6 +63,8 @@ void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *hsai)
 
 void audio_init(void)
 {
+    dsp_init();
+
     memset(audio_tx_buffer, 0, sizeof(audio_tx_buffer));
     memset(audio_rx_buffer, 0, sizeof(audio_rx_buffer));
 
