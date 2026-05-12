@@ -10,6 +10,7 @@ volatile uint32_t dsp_cycles_max;
 void dsp_init(void)
 {
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->LAR = 0xC5ACCE55;
     DWT->CYCCNT = 0;
     DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
 
@@ -17,6 +18,7 @@ void dsp_init(void)
     dsp_cycles_max  = 0;
 }
 
+__attribute__((used, retain))
 void dsp_set_gain(q15_t scale, int8_t shift)
 {
     s_gain_scale = scale;

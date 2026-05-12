@@ -37,6 +37,15 @@ add_executable(${CMAKE_PROJECT_NAME})
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
 
+# CMSIS-DSP — vendored from ARM-software/CMSIS-DSP.
+# Source/CMakeLists.txt builds a STATIC library target named CMSISDSP and
+# propagates its Include/ path PUBLIClly. Cortex-M7 flags are inherited from
+# the project toolchain (-mcpu / -mfpu / -mfloat-abi).
+# CMSISCORE points CMSIS-DSP at our CMSIS-Core headers (cmsis_compiler.h, etc.)
+# already vendored under Drivers/CMSIS/Include.
+set(CMSISCORE "${CMAKE_CURRENT_SOURCE_DIR}/Drivers/CMSIS")
+add_subdirectory(Middlewares/Third_Party/CMSIS-DSP/Source)
+
 # Link directories setup
 target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined library search paths
@@ -49,23 +58,14 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/dsp.c
 )
 
-# CMSIS-DSP — vendored source under Middlewares/Third_Party/CMSIS-DSP
-# Globs every .c under Source/; --gc-sections drops unused functions at link time.
-file(GLOB_RECURSE CMSIS_DSP_SRC
-    ${CMAKE_CURRENT_SOURCE_DIR}/Middlewares/Third_Party/CMSIS-DSP/Source/*.c
-)
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE ${CMSIS_DSP_SRC})
-
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
-    Middlewares/Third_Party/CMSIS-DSP/Include
-    Middlewares/Third_Party/CMSIS-DSP/PrivateInclude
+    # Add user defined include paths
 )
 
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     ARM_MATH_CM7
-    __FPU_PRESENT=1
 )
 
 # Remove wrong libob.a library dependency when using cpp files
@@ -74,6 +74,11 @@ list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 # Add linked libraries
 target_link_libraries(${CMAKE_PROJECT_NAME}
     stm32cubemx
+    CMSISDSP
+)
 
-    # Add user defined libraries
+# Force-keep symbols that exist only as debugger entry points.
+# --gc-sections would otherwise discard them since no source file calls them.
+target_link_options(${CMAKE_PROJECT_NAME} PRIVATE
+    -Wl,--undefined=dsp_set_gain
 )

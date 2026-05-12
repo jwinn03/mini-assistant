@@ -63,8 +63,6 @@ void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *hsai)
 
 void audio_init(void)
 {
-    dsp_init();
-
     memset(audio_tx_buffer, 0, sizeof(audio_tx_buffer));
     memset(audio_rx_buffer, 0, sizeof(audio_rx_buffer));
 
