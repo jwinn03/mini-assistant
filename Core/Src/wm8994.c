@@ -1,4 +1,5 @@
 #include "wm8994.h"
+#include "i2c3_bus.h"
 //#include "cmsis_os.h" // Only for osDelay - could just stick to pure FreeRTOS API if desired
 
 static I2C_HandleTypeDef *codec_i2c;
@@ -8,16 +9,21 @@ HAL_StatusTypeDef wm8994_write_reg(uint16_t reg, uint16_t value)
     uint8_t data[2];
     data[0] = (value >> 8) & 0xFF;
     data[1] = value & 0xFF;
-    return HAL_I2C_Mem_Write(codec_i2c, WM8994_I2C_ADDR, reg,
-                             I2C_MEMADD_SIZE_16BIT, data, 2, 100);
+    xSemaphoreTake(i2c3_mutex, portMAX_DELAY);
+    HAL_StatusTypeDef status = HAL_I2C_Mem_Write(codec_i2c, WM8994_I2C_ADDR, reg,
+                                                 I2C_MEMADD_SIZE_16BIT, data, 2, 100);
+    xSemaphoreGive(i2c3_mutex);
+    return status;
 }
 
 HAL_StatusTypeDef wm8994_read_reg(uint16_t reg, uint16_t *value)
 {
     uint8_t data[2];
     HAL_StatusTypeDef status;
+    xSemaphoreTake(i2c3_mutex, portMAX_DELAY);
     status = HAL_I2C_Mem_Read(codec_i2c, WM8994_I2C_ADDR, reg,
                               I2C_MEMADD_SIZE_16BIT, data, 2, 100);
+    xSemaphoreGive(i2c3_mutex);
     if (status == HAL_OK)
         *value = (data[0] << 8) | data[1];
     return status;

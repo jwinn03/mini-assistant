@@ -25,8 +25,13 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <string.h>
 #include "audio.h"
 #include "dsp.h"
+#include "sdram.h"
+#include "lcd.h"
+#include "i2c3_bus.h"
+#include "ui.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -1509,7 +1514,16 @@ static void MX_FMC_Init(void)
   }
 
   /* USER CODE BEGIN FMC_Init 2 */
-
+  /* Send the JEDEC power-up sequence and program refresh rate. CubeMX
+     configures the FMC controller but does not run the device-side init;
+     until this completes, reads from 0xC0000000 return undefined data. */
+  if (sdram_init_sequence(&hsdram1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* Zero the framebuffer so the LTDC's first scan (which begins inside
+     MX_LTDC_Init below) shows solid black instead of SDRAM garbage. */
+  memset((void *)LCD_FB_ADDR, 0, LCD_W * LCD_H * 2);
   /* USER CODE END FMC_Init 2 */
 }
 
@@ -1694,7 +1708,17 @@ void StartDefaultTask(void *argument)
   /* init code for USB_HOST */
   MX_USB_HOST_Init();
   /* USER CODE BEGIN 5 */
+  /* Order matters:
+     - i2c3_bus_init() must precede any WM8994 / FT5336 access (audio_init,
+       ui_init), since both drivers take this mutex on every transaction.
+     - lcd_init() creates the VBLANK semaphore and arms the LTDC line event.
+     - audio_init() starts SAI DMA + WM8994 register writes.
+     - ui_init() spawns the UI task, which calls ft5336_init() and then
+       polls touch / redraws the gain bar. */
+  i2c3_bus_init();
+  lcd_init();
   audio_init();
+  ui_init();
 
   for(;;)
   {

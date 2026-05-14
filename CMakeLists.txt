@@ -56,6 +56,11 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/wm8994.c
     Core/Src/audio.c
     Core/Src/dsp.c
+    Core/Src/sdram.c
+    Core/Src/lcd.c
+    Core/Src/i2c3_bus.c
+    Core/Src/ft5336.c
+    Core/Src/ui.c
 )
 
 # Add include paths
