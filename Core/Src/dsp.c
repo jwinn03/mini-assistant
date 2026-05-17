@@ -84,7 +84,11 @@ void dsp_init(void)
     dsp_cycles_max  = 0;
 }
 
-__attribute__((used, retain))
+/* `used` keeps the symbol in its object file; `--undefined=dsp_set_gain` in
+   CMakeLists.txt forces the linker to keep it through --gc-sections. The
+   `retain` attribute (GCC 11+) would be ideal here, but this toolchain
+   warns on it, and the combo above is sufficient. */
+__attribute__((used))
 void dsp_set_gain(q15_t scale, int8_t shift)
 {
     s_gain_scale = scale;

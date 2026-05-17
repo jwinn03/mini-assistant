@@ -70,10 +70,12 @@ bool ft5336_read(uint16_t *x, uint16_t *y)
     uint16_t raw_x = ((uint16_t)(buf[1] & 0x0F) << 8) | buf[2];
     uint16_t raw_y = ((uint16_t)(buf[3] & 0x0F) << 8) | buf[4];
 
-    /* Direct passthrough — F746G-DISCO touch axes are nominally aligned with
-       the LTDC pixel coordinate system. If touch reports inverted Y or
-       swapped axes during bring-up, adjust here. */
-    if (x) *x = raw_x;
-    if (y) *y = raw_y;
+    /* F746G-DISCO panel mounting: the FT5336's native X axis runs across
+       the LCD's short edge and its native Y across the long edge — i.e.
+       the touch and LTDC coordinate systems are transposed. Swap them so
+       callers can treat the result as LCD pixel coordinates. ST's
+       stm32746g_discovery_ts.c BSP does the same (TS_SWAP_XY mode). */
+    if (x) *x = raw_y;
+    if (y) *y = raw_x;
     return true;
 }
