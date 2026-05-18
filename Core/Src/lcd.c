@@ -167,7 +167,7 @@ void lcd_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg)
     const uint8_t *glyph = font8x16[idx - 0x20];
     for (uint8_t row = 0; row < LCD_FONT_H; row++) {
         uint8_t bits = glyph[row];
-        uint16_t *p = &LCD_FB[(y + row) * LCD_W + x];
+        uint16_t *p = &LCD_FB[(y + row) * LCD_W + x]; // calculate framebuffer pointer once per row
         for (uint8_t col = 0; col < LCD_FONT_W; col++) {
             *p++ = (bits & (0x80 >> col)) ? fg : bg;
         }

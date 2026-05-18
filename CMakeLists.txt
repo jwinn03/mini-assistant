@@ -56,6 +56,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/wm8994.c
     Core/Src/audio.c
     Core/Src/dsp.c
+    Core/Src/dsp_chain.c
+    Core/Src/effect_gain.c
     Core/Src/sdram.c
     Core/Src/lcd.c
     Core/Src/i2c3_bus.c
@@ -84,6 +86,8 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
 
 # Force-keep symbols that exist only as debugger entry points.
 # --gc-sections would otherwise discard them since no source file calls them.
+# Single dispatcher dsp_set_param() anchors all per-effect setters by reference,
+# so one --undefined entry covers every effect added in Phase 4.
 target_link_options(${CMAKE_PROJECT_NAME} PRIVATE
-    -Wl,--undefined=dsp_set_gain
+    -Wl,--undefined=dsp_set_param
 )

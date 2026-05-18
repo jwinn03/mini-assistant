@@ -52,11 +52,19 @@
 /* Entry Point */
 ENTRY(Reset_Handler)
 
-/* Specify the memory areas */
+/* Specify the memory areas.
+   SDRAM starts at 0xC0040000 — 256K above the framebuffer base at 0xC0000000
+   (480 * 272 * 2 = 261120 bytes, rounded up to 256K). Length 7M leaves slack
+   for the Phase 5 record/playback ring buffer.
+   MPU region 1 covers 0xC0000000+8M as write-through cacheable (see
+   Core/Src/main.c MPU_Config) so SDRAM placement needs no manual cache
+   maintenance. Anything tagged .sdram is NOLOAD — SDRAM contents are
+   undefined at reset and must be initialized at runtime. */
 MEMORY
 {
 DTCM (xrw)     : ORIGIN = 0x20000000, LENGTH = 64K
 SRAM (xrw)     : ORIGIN = 0x20010000, LENGTH = 256K
+SDRAM (xrw)    : ORIGIN = 0xC0040000, LENGTH = 7M
 FLASH (rx)     : ORIGIN = 0x8000000, LENGTH = 1024K
 }
 
@@ -156,6 +164,16 @@ SECTIONS
     *(.audio_buffers)
     . = ALIGN(4);
   } >DTCM
+
+  /* Large audio buffers in SDRAM (delay lines, reverb combs).
+     NOLOAD — contents undefined at reset, modules must memset on init. */
+  .sdram (NOLOAD) :
+  {
+    . = ALIGN(4);
+    *(.sdram)
+    *(.sdram*)
+    . = ALIGN(4);
+  } >SDRAM
 
   /* used by the startup to initialize data */
   _sidata = LOADADDR(.data);
