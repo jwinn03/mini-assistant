@@ -57,7 +57,14 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/audio.c
     Core/Src/dsp.c
     Core/Src/dsp_chain.c
+    Core/Src/dsp_util.c
     Core/Src/effect_gain.c
+    Core/Src/effect_clip.c
+    Core/Src/effect_fir.c
+    Core/Src/effect_eq.c
+    Core/Src/effect_delay.c
+    Core/Src/effect_chorus.c
+    Core/Src/effect_reverb.c
     Core/Src/sdram.c
     Core/Src/lcd.c
     Core/Src/i2c3_bus.c

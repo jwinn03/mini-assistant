@@ -2,19 +2,9 @@
 #define DSP_H
 
 #include <stdint.h>
-#include "arm_math.h"
-#include "effect_gain.h"
-
-/* Back-compat aliases for the Phase 3 gain UI. The current ui.c still uses
-   these names; they go away when the UI is refactored to the page widget. */
-#define DSP_GAIN_DB_MIN EFFECT_GAIN_DB_MIN
-#define DSP_GAIN_DB_MAX EFFECT_GAIN_DB_MAX
 
 void dsp_init(void);
 void process_audio(int16_t *in, int16_t *out, uint32_t len);
-
-/* Back-compat shim — delegates to effect_gain_set_db(). */
-void dsp_set_gain_db(float db);
 
 /* Single debugger entry point — replaces per-effect setters that would each
    need their own -Wl,--undefined entry in CMakeLists.txt. Effect-specific

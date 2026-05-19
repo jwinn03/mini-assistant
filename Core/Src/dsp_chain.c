@@ -1,5 +1,11 @@
 #include "dsp_chain.h"
 #include "effect_gain.h"
+#include "effect_clip.h"
+#include "effect_fir.h"
+#include "effect_eq.h"
+#include "effect_delay.h"
+#include "effect_chorus.h"
+#include "effect_reverb.h"
 #include "audio.h"
 #include "stm32f7xx.h"
 
@@ -39,11 +45,18 @@ void dsp_chain_init(void)
         s_enabled[i] = false;
         effect_cycles[i] = 0;
     }
-    /* Gain is the only Phase 4 effect on at boot — preserves Phase 3 behavior. */
+    /* Only Gain is on at boot — preserves Phase 3 behavior so a freshly-flashed
+       device sounds like a clean pass-through. Each other effect is engaged by
+       the UI's per-page enable toggle (tap the area above the slider). */
     s_enabled[EFFECT_ID_GAIN] = true;
 
     effect_gain_init();
-    /* Future: effect_clip_init(); effect_fir_init(); ... */
+    effect_clip_init();
+    effect_fir_init();
+    effect_eq_init();
+    effect_delay_init();
+    effect_chorus_init();
+    effect_reverb_init();
 }
 
 void dsp_chain_set_enabled(uint8_t effect_id, bool on)
@@ -68,9 +81,41 @@ void dsp_chain_process(int16_t *in, int16_t *out, uint32_t frames)
     }
     effect_cycles[EFFECT_ID_GAIN] = DWT->CYCCNT - t0;
 
-    /* Slots reserved — Phase 4 adds one effect per step in this order:
-         CLIP, FIR, EQ, DELAY, CHORUS, REVERB.
-       Each adds a t0/process/delta block here in chain order. */
+    t0 = DWT->CYCCNT;
+    if (s_enabled[EFFECT_ID_CLIP]) {
+        effect_clip_process(s_scratch_L, s_scratch_R, frames);
+    }
+    effect_cycles[EFFECT_ID_CLIP] = DWT->CYCCNT - t0;
+
+    t0 = DWT->CYCCNT;
+    if (s_enabled[EFFECT_ID_FIR]) {
+        effect_fir_process(s_scratch_L, s_scratch_R, frames);
+    }
+    effect_cycles[EFFECT_ID_FIR] = DWT->CYCCNT - t0;
+
+    t0 = DWT->CYCCNT;
+    if (s_enabled[EFFECT_ID_EQ]) {
+        effect_eq_process(s_scratch_L, s_scratch_R, frames);
+    }
+    effect_cycles[EFFECT_ID_EQ] = DWT->CYCCNT - t0;
+
+    t0 = DWT->CYCCNT;
+    if (s_enabled[EFFECT_ID_DELAY]) {
+        effect_delay_process(s_scratch_L, s_scratch_R, frames);
+    }
+    effect_cycles[EFFECT_ID_DELAY] = DWT->CYCCNT - t0;
+
+    t0 = DWT->CYCCNT;
+    if (s_enabled[EFFECT_ID_CHORUS]) {
+        effect_chorus_process(s_scratch_L, s_scratch_R, frames);
+    }
+    effect_cycles[EFFECT_ID_CHORUS] = DWT->CYCCNT - t0;
+
+    t0 = DWT->CYCCNT;
+    if (s_enabled[EFFECT_ID_REVERB]) {
+        effect_reverb_process(s_scratch_L, s_scratch_R, frames);
+    }
+    effect_cycles[EFFECT_ID_REVERB] = DWT->CYCCNT - t0;
 
     interleave(s_scratch_L, s_scratch_R, out, frames);
 }

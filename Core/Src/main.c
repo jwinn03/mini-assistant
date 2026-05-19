@@ -1722,7 +1722,7 @@ void StartDefaultTask(void *argument)
 
   for(;;)
   {
-    osDelay(1000)
+    osDelay(1000);
   }
   /* USER CODE END 5 */
 }
