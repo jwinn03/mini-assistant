@@ -32,12 +32,12 @@ extern I2C_HandleTypeDef hi2c3;
 #define SLIDER_H           30
 #define SLIDER_LABEL_GAP   6        /* label above the bar */
 #define SLIDER_TEXT_GAP    10       /* readout below the bar */
+/* Default 1-slider page geometry (Gain, Clip, FIR). 3-slider pages
+   (EQ, Delay, Chorus, Reverb) declare their own y positions inline
+   and use compact mode (no separate label row). */
 #define SLIDER1_BAR_Y      90
 #define SLIDER1_LABEL_Y    (SLIDER1_BAR_Y - LCD_FONT_H - SLIDER_LABEL_GAP)
 #define SLIDER1_TEXT_Y     (SLIDER1_BAR_Y + SLIDER_H + SLIDER_TEXT_GAP)
-#define SLIDER2_BAR_Y      180
-#define SLIDER2_LABEL_Y    (SLIDER2_BAR_Y - LCD_FONT_H - SLIDER_LABEL_GAP)
-#define SLIDER2_TEXT_Y     (SLIDER2_BAR_Y + SLIDER_H + SLIDER_TEXT_GAP)
 
 #define UI_TAB_ACTIVE      LCD_CYAN
 #define UI_TAB_INACTIVE    LCD_DKGRAY
