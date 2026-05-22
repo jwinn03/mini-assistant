@@ -70,6 +70,11 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/i2c3_bus.c
     Core/Src/ft5336.c
     Core/Src/ui.c
+    Core/Src/wav.c
+    Core/Src/sd_card.c
+    Core/Src/recorder.c
+    Core/Src/player.c
+    Core/Src/ui_page_record.c
 )
 
 # Add include paths

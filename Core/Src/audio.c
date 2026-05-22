@@ -1,6 +1,8 @@
 #include "audio.h"
 #include "wm8994.h"
 #include "dsp.h"
+#include "recorder.h"
+#include "player.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include <string.h>
@@ -35,11 +37,22 @@ static void audio_task(void *argument)
             dst = &audio_tx_buffer[AUDIO_HALF_SAMPLES];
         }
 
+        /* Pre-DSP record tap (no-op when state != RECORDING or tap != PRE). */
+        recorder_tap_pre(src, AUDIO_HALF_FRAMES);
+
         uint32_t t0 = DWT->CYCCNT;
         process_audio(src, dst, AUDIO_HALF_SAMPLES);
         uint32_t cycles = DWT->CYCCNT - t0;
         dsp_cycles_last = cycles;
         if (cycles > dsp_cycles_max) dsp_cycles_max = cycles;
+
+        /* Post-DSP record tap (no-op when state != RECORDING or tap != POST). */
+        recorder_tap_post(dst, AUDIO_HALF_FRAMES);
+
+        /* Playback injection — when PLAYING, overwrites dst with samples from
+           the SD-backed ring buffer (mic output is muted while playing back).
+           Called last so it has final say over what the codec hears. */
+        player_inject_post(dst, AUDIO_HALF_FRAMES);
     }
 }
 

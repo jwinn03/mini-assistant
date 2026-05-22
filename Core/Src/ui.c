@@ -9,9 +9,18 @@
 #include "effect_delay.h"
 #include "effect_chorus.h"
 #include "effect_reverb.h"
+#include "ui_page_record.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include <stdbool.h>
+
+/* The tab strip carries one slot per effect plus a "Rec" page for Phase 5
+   record/playback. Effect pages 0..EFFECT_COUNT-1 dispatch through the
+   shared slider/toggle path; index UI_PAGE_RECORD_IDX delegates to
+   ui_page_record_*. Tab width shrinks from 68 px to 60 px — verified that
+   "Chorus"/"Reverb" (6 chars × 8 = 48 px) still fit with 6 px margin. */
+#define UI_PAGE_COUNT       (EFFECT_COUNT + 1)
+#define UI_PAGE_RECORD_IDX  EFFECT_COUNT
 
 extern I2C_HandleTypeDef hi2c3;
 
@@ -312,21 +321,29 @@ static int strlen8(const char *s)
     return n;
 }
 
-/* Tab horizontal extents (proportional). For EFFECT_COUNT=7 and LCD_W=480
-   this yields tabs of 68 or 69 px — close enough that we don't bother with
-   a uniform grid. */
+/* Tab horizontal extents (proportional). For UI_PAGE_COUNT=8 and LCD_W=480
+   this yields uniform 60 px tabs — close enough to the original 68 px that
+   the rest of the layout is unchanged. */
 static inline uint16_t tab_x(uint8_t i)
 {
-    return (uint16_t)((uint32_t)i * LCD_W / EFFECT_COUNT);
+    return (uint16_t)((uint32_t)i * LCD_W / UI_PAGE_COUNT);
 }
 
 /* Hit-test the X coord to a tab index. */
 static inline uint8_t tab_hit(uint16_t x)
 {
-    uint8_t i = (uint8_t)((uint32_t)x * EFFECT_COUNT / LCD_W);
-    if (i >= EFFECT_COUNT) i = EFFECT_COUNT - 1;
+    uint8_t i = (uint8_t)((uint32_t)x * UI_PAGE_COUNT / LCD_W);
+    if (i >= UI_PAGE_COUNT) i = UI_PAGE_COUNT - 1;
     return i;
 }
+
+/* Tab names. The first EFFECT_COUNT entries mirror effect_names[]; the
+   trailing "Rec" is the Phase 5 record/playback page. Kept local instead
+   of extending dsp_chain's effect_names[] (which is sized by EFFECT_COUNT
+   and indexed by effect_id_t — the record page is not an effect). */
+static const char * const s_tab_names[UI_PAGE_COUNT] = {
+    "Gain", "Clip", "FIR", "EQ", "Delay", "Chorus", "Reverb", "Rec"
+};
 
 /* Format a float to integer/1-decimal with optional sign + unit suffix.
    No libm: integer round + manual digit emission. Buffer must hold ~16 chars. */
@@ -450,20 +467,20 @@ static void slider_draw(slider_t *s)
 static void tab_draw_one(uint8_t i, bool active)
 {
     uint16_t x0 = tab_x(i);
-    uint16_t x1 = (i + 1 == EFFECT_COUNT) ? LCD_W : tab_x(i + 1);
+    uint16_t x1 = (i + 1 == UI_PAGE_COUNT) ? LCD_W : tab_x(i + 1);
     uint16_t w  = x1 - x0;
     uint16_t bg = active ? UI_TAB_ACTIVE   : UI_TAB_INACTIVE;
     uint16_t fg = active ? UI_TAB_TEXT_ON  : UI_TAB_TEXT_OFF;
     lcd_fill_rect(x0, 0, w, TAB_H, bg);
-    const char *name = effect_names[i];
+    const char *name = s_tab_names[i];
     int name_len = strlen8(name);
     int max_chars = w / LCD_FONT_W;
     if (name_len > max_chars) name_len = max_chars;
     int nx = x0 + (w - name_len * LCD_FONT_W) / 2;
     int ny = (TAB_H - LCD_FONT_H) / 2;
     /* lcd_draw_text reads up to the null; truncating len means drawing all chars.
-       For our names (max 6) and tab width (>=68 px / 8 = 8 chars), truncation
-       won't happen — but the clamp keeps us safe. */
+       At 60 px tabs we fit 7 chars max — names cap at 6 so we're safe, but
+       the clamp keeps a future longer label from spilling into the next tab. */
     if (name_len == (int)strlen8(name)) {
         lcd_draw_text(nx, ny, name, fg, bg);
     } else {
@@ -475,7 +492,7 @@ static void tab_draw_one(uint8_t i, bool active)
 
 static void tabs_draw_all(uint8_t active)
 {
-    for (uint8_t i = 0; i < EFFECT_COUNT; i++) {
+    for (uint8_t i = 0; i < UI_PAGE_COUNT; i++) {
         tab_draw_one(i, i == active);
     }
 }
@@ -530,6 +547,16 @@ static void page_body_redraw(effect_page_t *p)
     page_invalidate(p);
 }
 
+/* Record-page body repaint: clear the same body region as effect pages,
+   then let ui_page_record paint its own layout. Kept here instead of inside
+   ui_page_record_redraw so the body-clear cost is paid uniformly across
+   all page switches. */
+static void record_page_body_redraw(void)
+{
+    lcd_fill_rect(0, BODY_TOP, LCD_W, LCD_H - BODY_TOP, UI_TEXT_BG);
+    ui_page_record_redraw();
+}
+
 /* ===== Touch dispatch ==================================================== */
 
 static int8_t hit_slider(effect_page_t *p, uint16_t y)
@@ -572,7 +599,11 @@ static void ui_task(void *arg)
 
     /* Initial paint — both tab strip and active page body. */
     tabs_draw_all(s_active_page);
-    page_body_redraw(&s_pages[s_active_page]);
+    if (s_active_page < EFFECT_COUNT) {
+        page_body_redraw(&s_pages[s_active_page]);
+    } else {
+        record_page_body_redraw();
+    }
 
     bool    prev_touch       = false;
     uint8_t displayed_page   = s_active_page;
@@ -583,38 +614,36 @@ static void ui_task(void *arg)
 
         uint16_t tx, ty;
         bool now_touch = ft5336_read(&tx, &ty);
+        bool edge      = (now_touch && !prev_touch);
 
         /* Tab selection — edge-triggered on touch press inside the tab strip.
            Re-checking each frame would let a held finger flip pages repeatedly. */
-        if (now_touch && !prev_touch && ty < TAB_TOUCH_H) {
+        if (edge && ty < TAB_TOUCH_H) {
             uint8_t hit = tab_hit(tx);
             if (hit != s_active_page) {
                 s_active_page = hit;
             }
         }
 
-        /* Enable toggle — edge-triggered tap on the bottom-right corner.
-           One tap flips the chain enable for the visible effect; next frame's
-           redraw refreshes the indicator. The zone sits below all slider
-           touch bands, so it never competes with a drag in progress. */
-        if (now_touch && !prev_touch
-            && tx >= ENABLE_TOUCH_LEFT && ty >= ENABLE_TOUCH_TOP) {
-            bool en = dsp_chain_get_enabled(s_active_page);
-            dsp_chain_set_enabled(s_active_page, !en);
-        }
-
-        /* Slider drag — continuous; updates every frame the touch is held.
-           Excludes the enable-toggle corner so a hold in the bottom-right
-           doesn't accidentally drag a slider whose touch band reaches that
-           far down (relevant for 3-slider pages like EQ). */
-        bool in_toggle_corner =
-            (tx >= ENABLE_TOUCH_LEFT && ty >= ENABLE_TOUCH_TOP);
-        if (now_touch && ty >= BODY_TOP && !in_toggle_corner) {
-            effect_page_t *p = &s_pages[s_active_page];
-            int8_t si = hit_slider(p, ty);
-            if (si >= 0) {
-                slider_drag_to(&p->sliders[si], tx);
+        if (s_active_page < EFFECT_COUNT) {
+            /* Effect page: enable toggle + slider drag, as before. */
+            if (edge && tx >= ENABLE_TOUCH_LEFT && ty >= ENABLE_TOUCH_TOP) {
+                bool en = dsp_chain_get_enabled(s_active_page);
+                dsp_chain_set_enabled(s_active_page, !en);
             }
+
+            bool in_toggle_corner =
+                (tx >= ENABLE_TOUCH_LEFT && ty >= ENABLE_TOUCH_TOP);
+            if (now_touch && ty >= BODY_TOP && !in_toggle_corner) {
+                effect_page_t *p = &s_pages[s_active_page];
+                int8_t si = hit_slider(p, ty);
+                if (si >= 0) {
+                    slider_drag_to(&p->sliders[si], tx);
+                }
+            }
+        } else if (now_touch && ty >= BODY_TOP) {
+            /* Record page: delegate to its hit-test. */
+            ui_page_record_touch(tx, ty, edge);
         }
 
         prev_touch = now_touch;
@@ -627,10 +656,14 @@ static void ui_task(void *arg)
         if (s_active_page != displayed_page) {
             tab_draw_one(displayed_page, false);
             tab_draw_one(s_active_page,  true);
-            page_body_redraw(&s_pages[s_active_page]);
+            if (s_active_page < EFFECT_COUNT) {
+                page_body_redraw(&s_pages[s_active_page]);
+            } else {
+                record_page_body_redraw();
+            }
             displayed_page = s_active_page;
-        } else {
-            /* Same page — repaint only the enable indicator when it changes. */
+        } else if (displayed_page < EFFECT_COUNT) {
+            /* Effect page on the same page — repaint enable indicator on change. */
             bool en = dsp_chain_get_enabled(displayed_page);
             if (en != s_drawn_enabled) {
                 enable_indicator_draw(en);
@@ -638,9 +671,13 @@ static void ui_task(void *arg)
             }
         }
 
-        effect_page_t *p = &s_pages[displayed_page];
-        for (uint8_t i = 0; i < p->slider_count; i++) {
-            slider_draw(&p->sliders[i]);
+        if (displayed_page < EFFECT_COUNT) {
+            effect_page_t *p = &s_pages[displayed_page];
+            for (uint8_t i = 0; i < p->slider_count; i++) {
+                slider_draw(&p->sliders[i]);
+            }
+        } else {
+            ui_page_record_tick();
         }
     }
 }

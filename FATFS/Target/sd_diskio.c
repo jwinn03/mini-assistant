@@ -75,7 +75,16 @@ See BSP_SD_ErrorCallback() and BSP_SD_AbortCallback() below
  * Notice: This is applicable only for cortex M7 based platform.
  */
 /* USER CODE BEGIN enableSDDmaCacheMaintenance */
-/* #define ENABLE_SD_DMA_CACHE_MAINTENANCE  1 */
+/* SRAM is normal-cacheable (write-back, write-allocate) by default on M7.
+   FATFS scratch buffers live in SRAM (FAT cache inside FATFS_t, plus app
+   stack buffers like our 44-byte WAV header). DMA read/write to those
+   addresses needs explicit cache maintenance or stale lines will corrupt
+   data both directions.
+
+   SDRAM (recorder/player rings) is mapped write-through via MPU region 1,
+   so the Clean is redundant there — but `SCB_CleanDCache_by_Addr` on a
+   write-through region is harmless. */
+#define ENABLE_SD_DMA_CACHE_MAINTENANCE  1
 /* USER CODE END enableSDDmaCacheMaintenance */
 
 /*

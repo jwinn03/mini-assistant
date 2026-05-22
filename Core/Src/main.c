@@ -32,6 +32,9 @@
 #include "lcd.h"
 #include "i2c3_bus.h"
 #include "ui.h"
+#include "sd_card.h"
+#include "recorder.h"
+#include "player.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -94,6 +97,7 @@ DMA_HandleTypeDef hdma_sai2_a;
 DMA_HandleTypeDef hdma_sai2_b;
 
 SD_HandleTypeDef hsd1;
+DMA_HandleTypeDef hdma_sdmmc1;
 
 SPDIFRX_HandleTypeDef hspdif;
 
@@ -1462,6 +1466,9 @@ static void MX_DMA_Init(void)
   __HAL_RCC_DMA2_CLK_ENABLE();
 
   /* DMA interrupt init */
+  /* DMA2_Stream3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream3_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream3_IRQn);
   /* DMA2_Stream4_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA2_Stream4_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream4_IRQn);
@@ -1612,11 +1619,11 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOI, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : uSD_Detect_Pin */
-  GPIO_InitStruct.Pin = uSD_Detect_Pin;
+  /*Configure GPIO pin : SD_DETECT_Pin */
+  GPIO_InitStruct.Pin = SD_DETECT_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(uSD_Detect_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(SD_DETECT_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : LCD_BL_CTRL_Pin */
   GPIO_InitStruct.Pin = LCD_BL_CTRL_Pin;
@@ -1713,11 +1720,19 @@ void StartDefaultTask(void *argument)
        ui_init), since both drivers take this mutex on every transaction.
      - lcd_init() creates the VBLANK semaphore and arms the LTDC line event.
      - audio_init() starts SAI DMA + WM8994 register writes.
-     - ui_init() spawns the UI task, which calls ft5336_init() and then
-       polls touch / redraws the gain bar. */
+     - sd_card_init() must run with the kernel running (sd_diskio's
+       osMessageQueueNew fails otherwise) and BEFORE recorder/player tasks
+       can start producing work on the FATFS volume.
+     - recorder_init / player_init spawn their tasks at IDLE state; the audio
+       task's tap/inject hooks are a no-op until those tasks are commanded.
+     - ui_init() spawns the UI task last so its first render finds the
+       record/playback subsystem already initialized. */
   i2c3_bus_init();
   lcd_init();
   audio_init();
+  sd_card_init();
+  recorder_init();
+  player_init();
   ui_init();
 
   for(;;)
