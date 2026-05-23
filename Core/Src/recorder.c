@@ -164,9 +164,7 @@ void recorder_tap_post(const int16_t *buf, uint32_t frames)
 
 /* Drain up to WRITE_CHUNK_BYTES from the ring to the file. Splits across
    the ring boundary into at most two f_write calls. Returns FR_OK on
-   success — on error, the caller transitions to ERROR. Takes the FATFS
-   mutex so a card-removal poll thread can't run f_mount(NULL,...) in the
-   middle of our write. */
+   success — on error, the caller transitions to ERROR. */
 static FRESULT drain_chunk(void)
 {
     uint32_t fill = ring_fill();
@@ -179,29 +177,14 @@ static FRESULT drain_chunk(void)
     uint32_t first = RING_BYTES - tail_phys;
     if (first > chunk) first = chunk;
 
-    sd_card_lock();
-    /* If the card was pulled between wake and lock acquisition, bail before
-       blocking on a doomed f_write. The lock is still held — release it
-       before returning. */
-    if (!sd_card_mounted()) {
-        sd_card_unlock();
-        return FR_DISK_ERR;
-    }
-
     UINT wrote = 0;
     FRESULT r = f_write(&s_file, &s_ring[tail_phys], first, &wrote);
-    if (r != FR_OK || wrote != first) {
-        sd_card_unlock();
-        return (r != FR_OK) ? r : FR_DISK_ERR;
-    }
+    if (r != FR_OK || wrote != first) return (r != FR_OK) ? r : FR_DISK_ERR;
 
     if (chunk > first) {
         uint32_t rem = chunk - first;
         r = f_write(&s_file, &s_ring[0], rem, &wrote);
-        if (r != FR_OK || wrote != rem) {
-            sd_card_unlock();
-            return (r != FR_OK) ? r : FR_DISK_ERR;
-        }
+        if (r != FR_OK || wrote != rem) return (r != FR_OK) ? r : FR_DISK_ERR;
     }
 
     s_data_bytes += chunk;
@@ -212,13 +195,13 @@ static FRESULT drain_chunk(void)
        the patched location, so we have to f_lseek back to end-of-data. */
     if (s_data_bytes - s_last_sync_data_bytes >= HEADER_SYNC_INTERVAL_BYTES) {
         FRESULT fr = wav_finalize(&s_file, s_data_bytes);
-        if (fr != FR_OK) { sd_card_unlock(); return fr; }
+        if (fr != FR_OK) return fr;
+        /* Restore cursor to end of data so further writes append. */
         fr = f_lseek(&s_file, WAV_HEADER_BYTES + s_data_bytes);
-        if (fr != FR_OK) { sd_card_unlock(); return fr; }
+        if (fr != FR_OK) return fr;
         s_last_sync_data_bytes = s_data_bytes;
     }
 
-    sd_card_unlock();
     return FR_OK;
 }
 
@@ -231,19 +214,14 @@ static FRESULT begin_recording(void)
 
     s_state = RECORDER_STATE_ARMED;
 
-    sd_card_lock();
-    if (!sd_card_mounted()) { sd_card_unlock(); return FR_DISK_ERR; }
-
     FRESULT r = f_open(&s_file, name, FA_CREATE_NEW | FA_WRITE);
-    if (r != FR_OK) { sd_card_unlock(); return r; }
+    if (r != FR_OK) return r;
 
     r = wav_write_header(&s_file);
     if (r != FR_OK) {
         f_close(&s_file);
-        sd_card_unlock();
         return r;
     }
-    sd_card_unlock();
 
     /* Reset ring + counters. Audio task is not yet tapping (state still ARMED),
        so head/tail mutations here are race-free. */
@@ -267,19 +245,16 @@ static FRESULT end_recording(void)
     s_state = RECORDER_STATE_STOPPING;
 
     /* Drain whatever is left. The audio task has stopped tapping so head
-       is stable. One pass is enough — fill is bounded by RING_BYTES.
-       drain_chunk takes the FATFS mutex internally. */
+       is stable. One pass is enough — fill is bounded by RING_BYTES. */
     while (ring_fill() > 0) {
         FRESULT r = drain_chunk();
         if (r != FR_OK) return r;
     }
 
-    sd_card_lock();
     FRESULT r = wav_finalize(&s_file, s_data_bytes);
-    if (r != FR_OK) { f_close(&s_file); sd_card_unlock(); return r; }
+    if (r != FR_OK) { f_close(&s_file); return r; }
 
     r = f_close(&s_file);
-    sd_card_unlock();
     if (r != FR_OK) return r;
 
     s_state = RECORDER_STATE_IDLE;
@@ -312,12 +287,8 @@ static void recorder_task(void *arg)
                 s_cmd = CMD_NONE;
                 FRESULT r = end_recording();
                 if (r != FR_OK) {
-                    /* Best-effort close on error so the FIL handle is freed.
-                       Card-removal path: f_close itself may fail; mutex still
-                       protects the call. */
-                    sd_card_lock();
+                    /* Best-effort close on error so the FIL handle is freed. */
                     f_close(&s_file);
-                    sd_card_unlock();
                     s_state = RECORDER_STATE_ERROR;
                 }
             } else {
@@ -326,9 +297,7 @@ static void recorder_task(void *arg)
                    head moves forward and we'll catch up on the next pass. */
                 FRESULT r = drain_chunk();
                 if (r != FR_OK) {
-                    sd_card_lock();
                     f_close(&s_file);
-                    sd_card_unlock();
                     s_state = RECORDER_STATE_ERROR;
                 }
             }

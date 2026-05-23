@@ -139,15 +139,7 @@ const Diskio_drvTypeDef  SD_Driver =
 };
 
 /* USER CODE BEGIN beforeFunctionSection */
-/* Bound each FATFS operation to ~1.5 s instead of the default 30 s. With
-   SDMMC hardware-flow disabled (per WM8994/SAI errata workaround) the
-   normal-case write of 32 KB completes in <50 ms on a class-10 card; a
-   pulled card or wedged controller resolves into FR_DISK_ERR within
-   1500 ms instead of stalling the recorder/player task for half a minute.
-   Three sequential waits per f_write × 1500 ms = ~4.5 s worst-case
-   cleanup latency for a single in-flight operation — acceptable. */
-#undef  SD_TIMEOUT
-#define SD_TIMEOUT 1500
+/* can be used to modify / undefine following code or add new code */
 /* USER CODE END beforeFunctionSection */
 
 /* Private functions ---------------------------------------------------------*/
@@ -682,36 +674,19 @@ void BSP_SD_ReadCpltCallback(void)
 }
 
 /* USER CODE BEGIN ErrorAbortCallbacks */
-/* Fires when HAL_SD_Abort_IT() completes — called from sd_card.c's removal
-   handler. Push a non-CPLT message so any task currently blocked in
-   osMessageQueueGet() inside SD_read/SD_write wakes immediately. The
-   diskio code checks `event == READ_CPLT_MSG` / `WRITE_CPLT_MSG`
-   explicitly; anything else (this 0xFFFF) falls through to RES_ERROR,
-   which propagates up as FR_DISK_ERR. Without this hook the blocked
-   task would wait the full SD_TIMEOUT before observing the abort. */
+/*
 void BSP_SD_AbortCallback(void)
 {
-    if (SDQueueID == NULL) return;
-    const uint16_t msg = 0xFFFFu;
-    osMessageQueuePut(SDQueueID, (const void *)&msg, 0, 0);
+#if (osCMSIS < 0x20000U)
+   osMessagePut(SDQueueID, RW_ABORT_MSG, 0);
+#else
+   const uint16_t msg = RW_ABORT_MSG;
+   osMessageQueuePut(SDQueueID, (const void *)&msg, 0, 0);
+#endif
 }
+*/
 /* USER CODE END ErrorAbortCallbacks */
 
 /* USER CODE BEGIN lastSection */
-/* Called from sd_card.c::handle_removal() after HAL_SD_Abort_IT has fired
-   BSP_SD_AbortCallback. If a recorder/player task was blocked in
-   SD_read/SD_write, it consumes the 0xFFFF message before we get here
-   (FreeRTOS lets the blocked task run while we're waiting on the FATFS
-   mutex). If no task was blocked, the message stays queued — and the
-   first SD_read/SD_write after re-insert would grab it as a stale error.
-   This helper drains any stale messages so the queue is clean for the
-   next operation. */
-void sd_diskio_drain_queue(void)
-{
-    if (SDQueueID == NULL) return;
-    uint16_t msg;
-    while (osMessageQueueGet(SDQueueID, (void *)&msg, NULL, 0) == osOK) {
-        /* discard */
-    }
-}
+/* can be used to modify / undefine previous code or add new code */
 /* USER CODE END lastSection */
