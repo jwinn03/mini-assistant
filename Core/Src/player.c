@@ -115,7 +115,8 @@ void player_inject_post(int16_t *buf, uint32_t frames)
 
 /* Push up to READ_CHUNK_BYTES from the file into the ring. Splits across
    ring wraparound into at most two f_read calls. Returns FR_OK on success.
-   Sets s_eof_reached when the data chunk is exhausted. */
+   Sets s_eof_reached when the data chunk is exhausted. Takes FATFS mutex
+   so an unmount path can't yank state mid-read. */
 static FRESULT refill_chunk(void)
 {
     if (s_eof_reached) return FR_OK;
@@ -135,28 +136,37 @@ static FRESULT refill_chunk(void)
     uint32_t first = RING_BYTES - head_phys;
     if (first > chunk) first = chunk;
 
+    sd_card_lock();
+    if (!sd_card_mounted()) {
+        sd_card_unlock();
+        return FR_DISK_ERR;
+    }
+
     UINT read = 0;
     FRESULT r = f_read(&s_file, &s_ring[head_phys], first, &read);
-    if (r != FR_OK) return r;
+    if (r != FR_OK) { sd_card_unlock(); return r; }
     if (read < first) {
         /* Partial read — file shorter than header advertised. Treat as EOF. */
         s_eof_reached = true;
         s_head        += read;
         s_bytes_read  += read;
+        sd_card_unlock();
         return FR_OK;
     }
 
     if (chunk > first) {
         uint32_t rem = chunk - first;
         r = f_read(&s_file, &s_ring[0], rem, &read);
-        if (r != FR_OK) return r;
+        if (r != FR_OK) { sd_card_unlock(); return r; }
         if (read < rem) {
             s_eof_reached = true;
             s_head        += first + read;
             s_bytes_read  += first + read;
+            sd_card_unlock();
             return FR_OK;
         }
     }
+    sd_card_unlock();
 
     s_head       += chunk;
     s_bytes_read += chunk;
@@ -170,8 +180,11 @@ static FRESULT begin_playback(void)
 {
     s_state = PLAYER_STATE_LOADING;
 
+    sd_card_lock();
+    if (!sd_card_mounted()) { sd_card_unlock(); return FR_DISK_ERR; }
     wav_info_t info;
     FRESULT r = wav_read_open(&s_file, s_filename, &info);
+    sd_card_unlock();
     if (r != FR_OK) return r;
 
     s_total_data_bytes  = info.data_bytes;
@@ -182,11 +195,17 @@ static FRESULT begin_playback(void)
     s_tail              = 0;
     s_frames_played     = 0;
 
-    /* Prefill before the audio task starts consuming. Multiple chunks until
-       we're at or above PREFILL_BYTES (or hit EOF for a very short file). */
+    /* Prefill before the audio task starts consuming. refill_chunk takes the
+       FATFS mutex per call — fine to loop here without holding it across
+       calls since the file handle state is owned by this task. */
     while (!s_eof_reached && ring_fill() < PREFILL_BYTES) {
         r = refill_chunk();
-        if (r != FR_OK) { f_close(&s_file); return r; }
+        if (r != FR_OK) {
+            sd_card_lock();
+            f_close(&s_file);
+            sd_card_unlock();
+            return r;
+        }
     }
 
     s_state = PLAYER_STATE_PLAYING;
@@ -196,7 +215,9 @@ static FRESULT begin_playback(void)
 static void end_playback(void)
 {
     /* Audio task already observed the IDLE transition; we just close. */
+    sd_card_lock();
     f_close(&s_file);
+    sd_card_unlock();
     s_eof_reached       = true;
     s_total_data_bytes  = 0;
     s_bytes_read        = 0;
@@ -241,13 +262,17 @@ static void player_task(void *arg)
                 FRESULT r = refill_chunk();
                 if (r != FR_OK) {
                     s_state = PLAYER_STATE_ERROR;
+                    sd_card_lock();
                     f_close(&s_file);
+                    sd_card_unlock();
                 }
             }
         } else if (state == PLAYER_STATE_ERROR) {
             if (cmd == CMD_STOP) {
                 s_cmd = CMD_NONE;
+                sd_card_lock();
                 f_close(&s_file);
+                sd_card_unlock();
                 s_state = PLAYER_STATE_IDLE;
                 s_total_data_bytes = 0;
             }

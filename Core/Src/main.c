@@ -1735,9 +1735,18 @@ void StartDefaultTask(void *argument)
   player_init();
   ui_init();
 
+  /* Default task moonlights as the SD card hot-swap monitor. PC13 is the
+     SD_DETECT pin (active-low — board has external pull-up per UM1907).
+     250 ms cadence is plenty for human-perceived insertion delay and
+     comfortably below the 1500 ms SD_TIMEOUT, so a yank-then-reinsert
+     sequence drives the state machine cleanly: yank → next poll detects
+     absence, calls handle_removal which aborts in-flight DMA and unmounts;
+     reinsert → next poll detects presence, calls try_mount which reads
+     a fresh boot sector. sd_card_poll handles all of this internally. */
   for(;;)
   {
-    osDelay(1000);
+    osDelay(250);
+    sd_card_poll();
   }
   /* USER CODE END 5 */
 }

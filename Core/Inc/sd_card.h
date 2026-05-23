@@ -28,8 +28,21 @@ bool sd_card_mounted(void);
 
 /* Re-checks card presence and attempts mount/unmount transitions. Safe to
    call from a low-priority task — does NOT block the audio path. Returns
-   true if the mount state changed (UI uses this to invalidate its file list). */
+   true if the mount state changed (UI uses this to invalidate its file list).
+   On removal: actively aborts any in-flight DMA via HAL_SD_Abort_IT, asks the
+   recorder/player to stop, takes the FATFS mutex once they're idle, and
+   unregisters the volume. UI sees s_mounted = false within one poll tick,
+   so its FATFS-touching code paths short-circuit before the slow cleanup
+   completes. */
 bool sd_card_poll(void);
+
+/* Mutex around all FATFS access. recorder, player, sd_card, and any UI
+   refresh path must take this before calling f_open / f_write / f_read /
+   f_lseek / f_sync / f_close / f_mount / f_opendir / f_readdir / f_closedir,
+   and release it immediately after. The audio task never touches FATFS so it
+   never takes this lock — priority inversion is therefore impossible. */
+void sd_card_lock(void);
+void sd_card_unlock(void);
 
 /* Fills out with the next "RECNNN.WAV" filename (uppercase, 8.3) based on the
    highest existing REC index scanned at mount. Buffer must be >= 13 bytes.
