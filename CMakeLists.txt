@@ -54,6 +54,17 @@ add_subdirectory(cmake/stm32cubemx)
 set(CMSISCORE "${CMAKE_CURRENT_SOURCE_DIR}/Drivers/CMSIS")
 add_subdirectory(Middlewares/Third_Party/CMSIS-DSP/Source)
 
+# CMSIS-NN — vendored from ARM-software/CMSIS-NN.
+# Builds a STATIC library target named `cmsis-nn` and propagates its Include/
+# path PUBLIClly. CMSIS-NN ships its own intrinsics header
+# (Include/Internal/arm_nn_compiler.h) so it does not actually depend on
+# cmsis_compiler.h from CMSIS-Core — but its CMakeLists unconditionally adds
+# ${CMSIS_PATH}/CMSIS/Core/Include to the target. Set CMSIS_PATH to a sensible
+# project-local path to suppress the bogus absolute include; the path itself
+# isn't read at compile time. Cortex-M7 flags propagate from the toolchain.
+set(CMSIS_PATH "${CMAKE_CURRENT_SOURCE_DIR}/Drivers" CACHE PATH "" FORCE)
+add_subdirectory(Middlewares/Third_Party/CMSIS-NN)
+
 # Link directories setup
 target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined library search paths
@@ -103,6 +114,7 @@ list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 target_link_libraries(${CMAKE_PROJECT_NAME}
     stm32cubemx
     CMSISDSP
+    cmsis-nn
 )
 
 # Force-keep symbols that exist only as debugger entry points.
