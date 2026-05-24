@@ -12,6 +12,13 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
 
+# C++ is needed for the TFLite Micro runtime in Phase 6. Toolchain already sets
+# -fno-rtti / -fno-exceptions / -fno-threadsafe-statics in gcc-arm-none-eabi.cmake,
+# so the C++ blast radius stays small (tflm_glue.cc only).
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
 
 # Define the build type
 if(NOT CMAKE_BUILD_TYPE)
@@ -28,8 +35,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
 project(${CMAKE_PROJECT_NAME})
 message("Build type: " ${CMAKE_BUILD_TYPE})
 
-# Enable CMake support for ASM and C languages
-enable_language(C ASM)
+# Enable CMake support for ASM, C, and C++ languages.
+# C++ is enabled for the TFLite Micro integration in Phase 6 (see tflm_glue.cc).
+enable_language(C CXX ASM)
 
 # Create an executable object type
 add_executable(${CMAKE_PROJECT_NAME})
@@ -75,6 +83,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/recorder.c
     Core/Src/player.c
     Core/Src/ui_page_record.c
+    Core/Src/tflm_glue.cc
 )
 
 # Add include paths

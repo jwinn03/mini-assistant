@@ -35,6 +35,7 @@
 #include "sd_card.h"
 #include "recorder.h"
 #include "player.h"
+#include "tflm_glue.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -227,6 +228,7 @@ int main(void)
   MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
   dsp_init();
+  tflm_glue_nop();  /* Phase 6 step 1: C++-link canary, no-op at runtime. */
   /* USER CODE END 2 */
 
   /* Init scheduler */
