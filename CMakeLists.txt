@@ -65,6 +65,10 @@ add_subdirectory(Middlewares/Third_Party/CMSIS-DSP/Source)
 set(CMSIS_PATH "${CMAKE_CURRENT_SOURCE_DIR}/Drivers" CACHE PATH "" FORCE)
 add_subdirectory(Middlewares/Third_Party/CMSIS-NN)
 
+# TFLite Micro — see Middlewares/Third_Party/tflm/CMakeLists.txt for how the
+# source tree was extracted from the upstream tflite-micro repo.
+add_subdirectory(Middlewares/Third_Party/tflm)
+
 # Link directories setup
 target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined library search paths
@@ -95,6 +99,10 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/player.c
     Core/Src/ui_page_record.c
     Core/Src/tflm_glue.cc
+    # Hello-world model array — copied from the upstream TFLM example. Excluded
+    # from the `tflm` library glob (see Middlewares/Third_Party/tflm/CMakeLists.txt),
+    # added here so the step-3 canary can resolve g_hello_world_float_model_data.
+    Middlewares/Third_Party/tflm/tensorflow/lite/micro/examples/hello_world/models/hello_world_float_model_data.cc
 )
 
 # Add include paths
@@ -115,6 +123,7 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
     stm32cubemx
     CMSISDSP
     cmsis-nn
+    tflm
 )
 
 # Force-keep symbols that exist only as debugger entry points.

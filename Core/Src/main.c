@@ -228,7 +228,8 @@ int main(void)
   MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
   dsp_init();
-  tflm_glue_nop();  /* Phase 6 step 1: C++-link canary, no-op at runtime. */
+  tflm_glue_nop();                              /* Phase 6 step 1 canary (kept). */
+  tflm_canary_result = tflm_glue_canary();      /* Phase 6 step 3 canary: real TFLM inference. */
   /* USER CODE END 2 */
 
   /* Init scheduler */
