@@ -34,25 +34,51 @@ file(GLOB_RECURSE TFLM_SOURCES
 list(FILTER TFLM_SOURCES EXCLUDE REGEX "_test\\.cc$")
 list(FILTER TFLM_SOURCES EXCLUDE REGEX "/fake_micro_context\\.cc$")
 list(FILTER TFLM_SOURCES EXCLUDE REGEX "/examples/")
+# cortex_m_generic/micro_time.cc references CMSIS-Core symbols (DCB,
+# DCB_DEMCR_TRCENA_Msk) that exist only in newer CMSIS revisions. Our CMSIS-Core
+# tree still uses the older `CoreDebug` name for the same block. Rather than
+# alias-define the new names, we exclude TFLM's version and provide
+# `tflite::GetCurrentTimeTicks()` / `ticks_per_second()` in
+# Core/Src/tflm_micro_time.cc using the DWT setup that dsp_init() already runs.
+list(FILTER TFLM_SOURCES EXCLUDE REGEX "/cortex_m_generic/micro_time\\.cc$")
 
 target_sources(tflm PRIVATE ${TFLM_SOURCES})
 
 # Public include directories. Consumers of `tflm` get all of these for free.
+# The two Drivers/ paths are needed because TFLM's cortex_m_generic target
+# (micro_time.cc) reaches for DWT / DCB from core_cm7.h, which lives under
+# our existing CMSIS-Core tree alongside the STM32F7xx device headers.
 target_include_directories(tflm PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flatbuffers/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/gemmlowp"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ruy"
+    "${CMAKE_SOURCE_DIR}/Drivers/CMSIS/Include"
+    "${CMAKE_SOURCE_DIR}/Drivers/CMSIS/Device/ST/STM32F7xx/Include"
+    # TFLM's cmsis_nn kernel adapters in kernels/cmsis_nn/*.cc do
+    # `#include "Include/arm_nnfunctions.h"` — i.e. they expect the CMSIS-NN
+    # root, not its Include/ subdir. The cmsis-nn target propagates Include/
+    # already (which works for `<arm_nnfunctions.h>` style), so we add the
+    # root here for the TFLM-style include. Single CMSIS-NN tree, two paths.
+    "${CMAKE_SOURCE_DIR}/Middlewares/Third_Party/CMSIS-NN"
 )
 
 # TFLM-required compile defines.
 #   TF_LITE_STATIC_MEMORY    : no malloc/free in the runtime
 #   TF_LITE_DISABLE_X86_NEON : forbid x86-only SIMD intrinsics
 #   CMSIS_NN                 : enables the cmsis_nn kernel adapters
+#   STM32F746xx              : selects the right device variant inside stm32f7xx.h
+#   ARMCM7                   : enables the DWT->LAR unlock branch in micro_time.cc
+#   CMSIS_DEVICE_..._FILE    : tells TFLM's cortex_m_generic/micro_time.cc which
+#                              CMSIS device header to include for DWT/DCB access.
+#                              The Makefile would normally set this; we don't use it.
 target_compile_definitions(tflm PUBLIC
     TF_LITE_STATIC_MEMORY
     TF_LITE_DISABLE_X86_NEON
     CMSIS_NN
+    STM32F746xx
+    ARMCM7
+    CMSIS_DEVICE_ARM_CORTEX_M_XX_HEADER_FILE=<stm32f7xx.h>
 )
 
 # TFLM is noisy. Suppress only what's actually emitted; do not blanket-disable.

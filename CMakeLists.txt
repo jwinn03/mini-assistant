@@ -99,6 +99,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/player.c
     Core/Src/ui_page_record.c
     Core/Src/tflm_glue.cc
+    # Replacement for upstream cortex_m_generic/micro_time.cc — see
+    # Core/Src/tflm_micro_time.cc for why. Excluded from the tflm lib glob.
+    Core/Src/tflm_micro_time.cc
     # Hello-world model array — copied from the upstream TFLM example. Excluded
     # from the `tflm` library glob (see Middlewares/Third_Party/tflm/CMakeLists.txt),
     # added here so the step-3 canary can resolve g_hello_world_float_model_data.
