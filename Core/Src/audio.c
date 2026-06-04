@@ -3,6 +3,7 @@
 #include "dsp.h"
 #include "recorder.h"
 #include "player.h"
+#include "decimator.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include <string.h>
@@ -37,8 +38,9 @@ static void audio_task(void *argument)
             dst = &audio_tx_buffer[AUDIO_HALF_SAMPLES];
         }
 
-        /* Pre-DSP record tap (no-op when state != RECORDING or tap != PRE). */
-        recorder_tap_pre(src, AUDIO_HALF_FRAMES);
+        /* Pre-DSP fan-out: both consumers read the raw stereo from `src`. */
+        decimator_push_stereo(src, AUDIO_HALF_FRAMES);   /* feeds wake-word path (16 kHz mono). */
+        recorder_tap_pre(src, AUDIO_HALF_FRAMES);        /* no-op unless RECORDING && tap=PRE. */
 
         uint32_t t0 = DWT->CYCCNT;
         process_audio(src, dst, AUDIO_HALF_SAMPLES);

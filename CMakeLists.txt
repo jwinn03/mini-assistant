@@ -69,6 +69,25 @@ add_subdirectory(Middlewares/Third_Party/CMSIS-NN)
 # source tree was extracted from the upstream tflite-micro repo.
 add_subdirectory(Middlewares/Third_Party/tflm)
 
+# Generate a C array from the .tflite binary at configure time. The generated
+# .cc file lives in the build tree so the source tree stays clean and a model
+# swap is just a file replacement under Models/.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(WW_MODEL_TFLITE "${CMAKE_SOURCE_DIR}/Models/hey_jarvis.tflite")
+set(WW_MODEL_CC     "${CMAKE_BINARY_DIR}/generated/hey_jarvis_model_data.cc")
+add_custom_command(
+    OUTPUT  "${WW_MODEL_CC}"
+    COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_SOURCE_DIR}/tools/embed_model.py"
+            "${WW_MODEL_TFLITE}"
+            "${WW_MODEL_CC}"
+            "hey_jarvis_tflite"
+    DEPENDS "${WW_MODEL_TFLITE}"
+            "${CMAKE_SOURCE_DIR}/tools/embed_model.py"
+    COMMENT "Embedding ${WW_MODEL_TFLITE} as ${WW_MODEL_CC}"
+    VERBATIM
+)
+
 # Link directories setup
 target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined library search paths
@@ -98,7 +117,13 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/recorder.c
     Core/Src/player.c
     Core/Src/ui_page_record.c
+    Core/Src/decimator.c
+    Core/Src/mel_fbank.c
+    Core/Src/wake_word.cc
     Core/Src/tflm_glue.cc
+    # Build-time-generated model data array. The custom command above produces
+    # this file from Models/hey_jarvis.tflite at configure time.
+    ${WW_MODEL_CC}
     # Replacement for upstream cortex_m_generic/micro_time.cc — see
     # Core/Src/tflm_micro_time.cc for why. Excluded from the tflm lib glob.
     Core/Src/tflm_micro_time.cc
@@ -110,7 +135,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
-    # Add user defined include paths
+    Models   # for hey_jarvis_model_data.h
 )
 
 # Add project symbols (macros)

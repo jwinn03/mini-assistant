@@ -36,6 +36,9 @@
 #include "recorder.h"
 #include "player.h"
 #include "tflm_glue.h"
+#include "decimator.h"
+#include "mel_fbank.h"
+#include "wake_word.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -228,6 +231,9 @@ int main(void)
   MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
   dsp_init();
+  decimator_init();                             /* Phase 6 step 4: 48->16 kHz mono path. */
+  mel_fbank_init();                             /* Phase 6 step 5: log-mel front end. */
+  mel_fbank_selftest(1000.0f);                  /*   one-shot 1 kHz sine through the pipeline. */
   tflm_glue_nop();                              /* Phase 6 step 1 canary (kept). */
   tflm_canary_result = tflm_glue_canary();      /* Phase 6 step 3 canary: real TFLM inference. */
   /* USER CODE END 2 */
@@ -1736,6 +1742,10 @@ void StartDefaultTask(void *argument)
   sd_card_init();
   recorder_init();
   player_init();
+  /* wake_word_init spawns the wake-word task; must run AFTER audio_init so
+     the decimator (fed from the audio task) is producing samples by the time
+     the wake-word task starts polling decimator_ring. */
+  wake_word_init();
   ui_init();
 
   for(;;)
