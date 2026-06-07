@@ -13,6 +13,8 @@
 
 #include "wake_word.h"
 
+#include <string.h>
+
 #include "FreeRTOS.h"
 #include "task.h"
 #include "stm32f7xx.h"        /* DWT for cycle measurement of Invoke() */
@@ -35,6 +37,26 @@ extern "C" volatile uint32_t wake_word_total_fires           = 0;
 extern "C" volatile uint32_t wake_word_last_inference_cycles = 0;
 extern "C" volatile int32_t  wake_word_init_status           = 0;
 
+/* Diagnostic globals (see wake_word.h). */
+extern "C" volatile uint8_t  wake_word_model_op_count   = 0;
+extern "C" volatile uint16_t wake_word_model_ops[WAKE_WORD_MAX_OPS] = {};
+extern "C" volatile uint8_t  wake_word_model_has_custom = 0;
+extern "C" volatile uint32_t wake_word_arena_used       = 0;
+
+extern "C" volatile uint8_t  wake_word_input_dims_count = 0;
+extern "C" volatile int32_t  wake_word_input_dims[WAKE_WORD_MAX_DIMS] = {};
+extern "C" volatile uint32_t wake_word_input_elements   = 0;
+extern "C" volatile uint8_t  wake_word_input_type       = 0;
+extern "C" volatile float    wake_word_input_scale      = 0.0f;
+extern "C" volatile int32_t  wake_word_input_zero_point = 0;
+
+extern "C" volatile uint8_t  wake_word_output_dims_count = 0;
+extern "C" volatile int32_t  wake_word_output_dims[WAKE_WORD_MAX_DIMS] = {};
+extern "C" volatile uint32_t wake_word_output_elements   = 0;
+extern "C" volatile uint8_t  wake_word_output_type       = 0;
+extern "C" volatile float    wake_word_output_scale      = 0.0f;
+extern "C" volatile int32_t  wake_word_output_zero_point = 0;
+
 namespace {
 
 /* Trigger policy — keep close to the plan's 0.95 + ≥3 frames + 200 ms
@@ -45,9 +67,10 @@ constexpr uint32_t kMinConsecutive  = 3u;
 constexpr uint32_t kCooldownFrames  = 10u;   /* 10 * 20 ms = 200 ms */
 
 /* TFLM arena lives in SDRAM (.sdram section, MPU region 1 = write-through
-   cacheable, no maintenance needed). 60 KB gives the model plenty of slack;
-   real usage will be ~half that. */
-constexpr uint32_t kArenaSize       = 60u * 1024u;
+   cacheable, no maintenance needed). 80 KB gives generous slack so we can
+   rule out arena-too-small as a cause of AllocateTensors failure when
+   diagnosing missing ops. */
+constexpr uint32_t kArenaSize       = 80u * 1024u;
 __attribute__((section(".sdram"), aligned(16)))
 static uint8_t s_arena[kArenaSize];
 
@@ -56,10 +79,20 @@ static uint8_t s_arena[kArenaSize];
    (the arena absorbs unused ones for free). */
 constexpr int kMaxResourceVariables = 24;
 
+/* The V2 hey_jarvis model expects a stack of the 3 most-recent mel feature
+   frames as input (3 * 40 = 120 elements). The model also maintains
+   longer-term state via TF Lite resource variables (CALL_ONCE / VAR_HANDLE
+   etc. in the op list). If the chosen wake-word model uses a different
+   stack depth, init bails with -6 and you set kFrameHistory accordingly. */
+constexpr uint32_t kFrameHistory   = 3u;
+constexpr uint32_t kInputElements  = kFrameHistory * MEL_FBANK_N_MELS;
+
 /* Op resolver — superset of what microWakeWord V2 models are known to use.
    Each registration is ~1 KB of FLASH that --gc-sections cannot strip; if
-   tightening FLASH later, prune to only the ops the model actually exercises. */
-using WakeOpResolver = tflite::MicroMutableOpResolver<18>;
+   tightening FLASH later, prune to only the ops the model actually exercises.
+   Includes resource-variable ops (VAR_HANDLE, READ/ASSIGN_VARIABLE, CALL_ONCE)
+   because streaming TFLM models often use them for persistent state. */
+using WakeOpResolver = tflite::MicroMutableOpResolver<26>;
 
 tflite::MicroAllocator*          s_allocator   = nullptr;
 tflite::MicroResourceVariables*  s_resource    = nullptr;
@@ -71,7 +104,11 @@ static uint8_t s_interp_storage[sizeof(tflite::MicroInterpreter)];
 /* Sliding state for the task loop. */
 int16_t s_window[MEL_FBANK_WIN_SIZE];
 float   s_features[MEL_FBANK_N_MELS];
-uint32_t s_consecutive_above = 0;
+/* Stack of the most-recent kFrameHistory mel frames. Layout: oldest at
+   offset 0, newest at offset (kFrameHistory - 1) * MEL_FBANK_N_MELS. */
+__attribute__((section(".audio_buffers")))
+float    s_feature_stack[kInputElements];
+uint32_t s_consecutive_above  = 0;
 uint32_t s_cooldown_remaining = 0;
 
 TfLiteStatus register_ops(WakeOpResolver& r)
@@ -94,7 +131,40 @@ TfLiteStatus register_ops(WakeOpResolver& r)
     TF_LITE_ENSURE_STATUS(r.AddRelu());
     TF_LITE_ENSURE_STATUS(r.AddRelu6());
     TF_LITE_ENSURE_STATUS(r.AddTanh());
+    /* Streaming model state machinery. */
+    TF_LITE_ENSURE_STATUS(r.AddVarHandle());
+    TF_LITE_ENSURE_STATUS(r.AddReadVariable());
+    TF_LITE_ENSURE_STATUS(r.AddAssignVariable());
+    TF_LITE_ENSURE_STATUS(r.AddCallOnce());
+    /* Misc that some KWS models pull in. */
+    TF_LITE_ENSURE_STATUS(r.AddLeakyRelu());
+    TF_LITE_ENSURE_STATUS(r.AddHardSwish());
+    TF_LITE_ENSURE_STATUS(r.AddMean());
+    TF_LITE_ENSURE_STATUS(r.AddSub());
     return kTfLiteOk;
+}
+
+/* Walk the model's operator_codes table and copy the builtin code of each
+   unique op into wake_word_model_ops[]. Lets the debugger see the model's
+   ops without needing TFLM's ErrorReporter to be wired up. */
+static void dump_model_ops(const tflite::Model* model)
+{
+    auto* op_codes = model->operator_codes();
+    if (op_codes == nullptr) return;
+
+    uint32_t out = 0;
+    for (uint32_t i = 0;
+         i < op_codes->size() && out < WAKE_WORD_MAX_OPS;
+         i++)
+    {
+        auto* oc = op_codes->Get(i);
+        if (oc == nullptr) continue;
+        if (oc->custom_code() != nullptr) {
+            wake_word_model_has_custom = 1;
+        }
+        wake_word_model_ops[out++] = (uint16_t)oc->builtin_code();
+    }
+    wake_word_model_op_count = (uint8_t)out;
 }
 
 void feed_features_to_input()
@@ -104,19 +174,19 @@ void feed_features_to_input()
         const float scale = input->params.scale;
         const int   zp    = input->params.zero_point;
         const float inv_s = (scale != 0.0f) ? (1.0f / scale) : 0.0f;
-        for (uint32_t i = 0; i < MEL_FBANK_N_MELS; i++) {
-            int32_t q = (int32_t)(s_features[i] * inv_s) + zp;
+        for (uint32_t i = 0; i < kInputElements; i++) {
+            int32_t q = (int32_t)(s_feature_stack[i] * inv_s) + zp;
             if (q < -128) q = -128;
             if (q >  127) q =  127;
             input->data.int8[i] = (int8_t)q;
         }
     } else if (input->type == kTfLiteFloat32) {
-        for (uint32_t i = 0; i < MEL_FBANK_N_MELS; i++) {
-            input->data.f[i] = s_features[i];
+        for (uint32_t i = 0; i < kInputElements; i++) {
+            input->data.f[i] = s_feature_stack[i];
         }
     }
-    /* Other input types (uint8, int16) would need additional branches; the
-       V2 microWakeWord models are int8 quantised so we expect that path. */
+    /* If a future model wants uint8 input it would need its own branch here;
+       the V2 microWakeWord models are int8 quantised so we expect that path. */
 }
 
 float read_output_confidence()
@@ -124,6 +194,10 @@ float read_output_confidence()
     auto* output = s_interpreter->output(0);
     if (output->type == kTfLiteInt8) {
         const int8_t q = output->data.int8[0];
+        return ((float)q - (float)output->params.zero_point) * output->params.scale;
+    }
+    if (output->type == kTfLiteUInt8) {
+        const uint8_t q = output->data.uint8[0];
         return ((float)q - (float)output->params.zero_point) * output->params.scale;
     }
     if (output->type == kTfLiteFloat32) {
@@ -173,6 +247,32 @@ void wake_word_task(void* /*arg*/)
 
         mel_fbank_process(s_window, s_features);
 
+        /* Crude bridge between our log-mel features and what microWakeWord's
+           audio_microfrontend would produce. The model expects features in
+           ~[0, 26]; ours land in ~[-14, +8]. A constant offset of +14 makes
+           the floor non-negative; the clip keeps quiet bins from going
+           further below. This does NOT match the training-time front end
+           (PCAN + smoothing + log-shift) and exists only to prove the model
+           responds to input. Replacing this with a faithful audio_microfrontend
+           port is the proper Phase-6-completion task. */
+        for (uint32_t i = 0; i < MEL_FBANK_N_MELS; i++) {
+            float v = s_features[i] + 14.0f;
+            if (v < 0.0f) v = 0.0f;
+            s_features[i] = v;
+        }
+
+        /* Shift the feature stack one frame older and append the new one at
+           the end. Net effect: stack always holds the most-recent
+           kFrameHistory frames, oldest at offset 0. Until kFrameHistory
+           frames have actually been produced (~60 ms after boot), the
+           leading frames are zero — accepted as a brief warm-up artefact. */
+        memmove(&s_feature_stack[0],
+                &s_feature_stack[MEL_FBANK_N_MELS],
+                (kInputElements - MEL_FBANK_N_MELS) * sizeof(float));
+        memcpy(&s_feature_stack[kInputElements - MEL_FBANK_N_MELS],
+               s_features,
+               MEL_FBANK_N_MELS * sizeof(float));
+
         feed_features_to_input();
         const uint32_t t0 = DWT->CYCCNT;
         TfLiteStatus rc = s_interpreter->Invoke();
@@ -200,6 +300,10 @@ extern "C" void wake_word_init(void)
         return;
     }
 
+    /* Diagnostic: surface the model's op list before anything else can fail.
+       Even if init bails later, the user can read wake_word_model_ops[]. */
+    dump_model_ops(model);
+
     if (register_ops(s_resolver) != kTfLiteOk) {
         wake_word_init_status = -2;
         return;
@@ -226,19 +330,63 @@ extern "C" void wake_word_init(void)
         return;
     }
 
-    /* Smoke-check: confirm input geometry matches our feature vector. The
-       model may want (1, 1, 40, 1) or (1, 40); element count is what
-       matters for our memcpy-style fill. */
+    /* Surface actual arena usage so we can tighten kArenaSize later if we
+       want to reclaim SDRAM. */
+    wake_word_arena_used = (uint32_t)s_interpreter->arena_used_bytes();
+
+    /* Dump input + output tensor geometry so we can adapt the feature
+       pipeline once we know what the model actually expects. */
+    {
+        auto* in = s_interpreter->input(0);
+        if (in != nullptr && in->dims != nullptr) {
+            const int n = in->dims->size;
+            wake_word_input_dims_count = (uint8_t)(n > (int)WAKE_WORD_MAX_DIMS ? WAKE_WORD_MAX_DIMS : n);
+            uint32_t elems = 1;
+            for (int d = 0; d < n; d++) {
+                if (d < (int)WAKE_WORD_MAX_DIMS) {
+                    wake_word_input_dims[d] = in->dims->data[d];
+                }
+                elems *= (uint32_t)in->dims->data[d];
+            }
+            wake_word_input_elements   = elems;
+            wake_word_input_type       = (uint8_t)in->type;
+            wake_word_input_scale      = in->params.scale;
+            wake_word_input_zero_point = in->params.zero_point;
+        }
+        auto* out = s_interpreter->output(0);
+        if (out != nullptr && out->dims != nullptr) {
+            const int n = out->dims->size;
+            wake_word_output_dims_count = (uint8_t)(n > (int)WAKE_WORD_MAX_DIMS ? WAKE_WORD_MAX_DIMS : n);
+            uint32_t elems = 1;
+            for (int d = 0; d < n; d++) {
+                if (d < (int)WAKE_WORD_MAX_DIMS) {
+                    wake_word_output_dims[d] = out->dims->data[d];
+                }
+                elems *= (uint32_t)out->dims->data[d];
+            }
+            wake_word_output_elements   = elems;
+            wake_word_output_type       = (uint8_t)out->type;
+            wake_word_output_scale      = out->params.scale;
+            wake_word_output_zero_point = out->params.zero_point;
+        }
+    }
+
+    /* Smoke-check: confirm input geometry matches our kFrameHistory * 40
+       stacked feature vector. */
     if (s_interpreter->input(0)->dims->size > 0) {
         uint32_t in_elems = 1;
         for (int d = 0; d < s_interpreter->input(0)->dims->size; d++) {
             in_elems *= (uint32_t)s_interpreter->input(0)->dims->data[d];
         }
-        if (in_elems != MEL_FBANK_N_MELS) {
+        if (in_elems != kInputElements) {
             wake_word_init_status = -6;
             return;
         }
     }
+
+    /* Zero the feature stack so the first kFrameHistory invocations see
+       silence padding ahead of any real audio. */
+    memset(s_feature_stack, 0, sizeof(s_feature_stack));
 
     /* Init succeeded. wake_word_init_status will tick up to mirror
        wake_word_total_inferences as soon as the task starts producing. */

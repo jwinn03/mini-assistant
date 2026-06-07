@@ -117,6 +117,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/recorder.c
     Core/Src/player.c
     Core/Src/ui_page_record.c
+    Core/Src/ui_page_assistant.c
     Core/Src/decimator.c
     Core/Src/mel_fbank.c
     Core/Src/wake_word.cc

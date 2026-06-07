@@ -33,6 +33,37 @@ extern volatile uint32_t wake_word_last_inference_cycles;
    failures with the code matching wake_word.cc internal sentinels. */
 extern volatile int32_t wake_word_init_status;
 
+/* Diagnostic: at init we walk the model's operator_codes table and copy each
+   builtin code into wake_word_model_ops[]. Cross-reference with the
+   BuiltinOperator enum in tensorflow/lite/schema/schema_generated.h to see
+   which ops the model expects vs. what we registered in the resolver.
+   Useful when AllocateTensors fails with -5 to spot the missing op. */
+#define WAKE_WORD_MAX_OPS 48u
+extern volatile uint8_t  wake_word_model_op_count;
+extern volatile uint16_t wake_word_model_ops[WAKE_WORD_MAX_OPS];
+extern volatile uint8_t  wake_word_model_has_custom;
+extern volatile uint32_t wake_word_arena_used;     /* AllocateTensors result */
+
+/* Tensor geometry diagnostics. Filled after AllocateTensors() so we can
+   read off the shape / type / quantization params without instrumenting
+   TFLM internals. Dim arrays hold up to 8 dimensions; entries past
+   *_dims_count are undefined. Types use TfLiteType enum values
+   (kTfLiteFloat32 = 1, kTfLiteInt8 = 9, etc.). */
+#define WAKE_WORD_MAX_DIMS 8u
+extern volatile uint8_t  wake_word_input_dims_count;
+extern volatile int32_t  wake_word_input_dims[WAKE_WORD_MAX_DIMS];
+extern volatile uint32_t wake_word_input_elements;
+extern volatile uint8_t  wake_word_input_type;
+extern volatile float    wake_word_input_scale;
+extern volatile int32_t  wake_word_input_zero_point;
+
+extern volatile uint8_t  wake_word_output_dims_count;
+extern volatile int32_t  wake_word_output_dims[WAKE_WORD_MAX_DIMS];
+extern volatile uint32_t wake_word_output_elements;
+extern volatile uint8_t  wake_word_output_type;
+extern volatile float    wake_word_output_scale;
+extern volatile int32_t  wake_word_output_zero_point;
+
 #ifdef __cplusplus
 }
 #endif

@@ -35,15 +35,20 @@ def main() -> int:
         f.write("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n")
         # 16-byte alignment: TFLite FlatBuffer access wants at least 4-byte
         # alignment; 16 gives headroom and matches what TFLM examples use.
+        #
+        # `extern` is load-bearing: in C++, top-level `const` defaults to
+        # internal linkage. `extern "C"` only controls name mangling. Without
+        # the explicit extern keyword, the symbol stays file-local and the
+        # consumer .cc gets an undefined reference at link time.
         f.write(
             "__attribute__((aligned(16))) "
-            f"const unsigned char {var}[] = {{\n"
+            f"extern const unsigned char {var}[] = {{\n"
         )
         for i in range(0, len(data), 16):
             chunk = data[i : i + 16]
             f.write("    " + ", ".join(f"0x{b:02x}" for b in chunk) + ",\n")
         f.write("};\n\n")
-        f.write(f"const unsigned int {var}_len = {len(data)};\n\n")
+        f.write(f"extern const unsigned int {var}_len = {len(data)};\n\n")
         f.write("#ifdef __cplusplus\n}\n#endif\n")
 
     return 0

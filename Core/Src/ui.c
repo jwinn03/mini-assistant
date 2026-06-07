@@ -10,17 +10,20 @@
 #include "effect_chorus.h"
 #include "effect_reverb.h"
 #include "ui_page_record.h"
+#include "ui_page_assistant.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include <stdbool.h>
 
-/* The tab strip carries one slot per effect plus a "Rec" page for Phase 5
-   record/playback. Effect pages 0..EFFECT_COUNT-1 dispatch through the
-   shared slider/toggle path; index UI_PAGE_RECORD_IDX delegates to
-   ui_page_record_*. Tab width shrinks from 68 px to 60 px — verified that
-   "Chorus"/"Reverb" (6 chars × 8 = 48 px) still fit with 6 px margin. */
-#define UI_PAGE_COUNT       (EFFECT_COUNT + 1)
-#define UI_PAGE_RECORD_IDX  EFFECT_COUNT
+/* The tab strip carries one slot per effect plus "Rec" (Phase 5
+   record/playback) and "Asst" (Phase 6 wake-word stub). Effect pages
+   0..EFFECT_COUNT-1 dispatch through the shared slider/toggle path; the two
+   higher indices delegate to their own ui_page_*_redraw/tick/touch hooks.
+   Tab width with UI_PAGE_COUNT=9 is 480/9 ≈ 53 px, still wide enough for
+   the longest label "Chorus"/"Reverb" (48 px text). */
+#define UI_PAGE_COUNT          (EFFECT_COUNT + 2)
+#define UI_PAGE_RECORD_IDX     EFFECT_COUNT
+#define UI_PAGE_ASSISTANT_IDX  (EFFECT_COUNT + 1)
 
 extern I2C_HandleTypeDef hi2c3;
 
@@ -342,7 +345,7 @@ static inline uint8_t tab_hit(uint16_t x)
    of extending dsp_chain's effect_names[] (which is sized by EFFECT_COUNT
    and indexed by effect_id_t — the record page is not an effect). */
 static const char * const s_tab_names[UI_PAGE_COUNT] = {
-    "Gain", "Clip", "FIR", "EQ", "Delay", "Chorus", "Reverb", "Rec"
+    "Gain", "Clip", "FIR", "EQ", "Delay", "Chorus", "Reverb", "Rec", "Asst"
 };
 
 /* Format a float to integer/1-decimal with optional sign + unit suffix.
@@ -557,6 +560,13 @@ static void record_page_body_redraw(void)
     ui_page_record_redraw();
 }
 
+/* Same pattern for the assistant page. */
+static void assistant_page_body_redraw(void)
+{
+    lcd_fill_rect(0, BODY_TOP, LCD_W, LCD_H - BODY_TOP, UI_TEXT_BG);
+    ui_page_assistant_redraw();
+}
+
 /* ===== Touch dispatch ==================================================== */
 
 static int8_t hit_slider(effect_page_t *p, uint16_t y)
@@ -601,8 +611,10 @@ static void ui_task(void *arg)
     tabs_draw_all(s_active_page);
     if (s_active_page < EFFECT_COUNT) {
         page_body_redraw(&s_pages[s_active_page]);
-    } else {
+    } else if (s_active_page == UI_PAGE_RECORD_IDX) {
         record_page_body_redraw();
+    } else {
+        assistant_page_body_redraw();
     }
 
     bool    prev_touch       = false;
@@ -641,9 +653,15 @@ static void ui_task(void *arg)
                     slider_drag_to(&p->sliders[si], tx);
                 }
             }
-        } else if (now_touch && ty >= BODY_TOP) {
+        } else if (s_active_page == UI_PAGE_RECORD_IDX) {
             /* Record page: delegate to its hit-test. */
-            ui_page_record_touch(tx, ty, edge);
+            if (now_touch && ty >= BODY_TOP) {
+                ui_page_record_touch(tx, ty, edge);
+            }
+        } else if (s_active_page == UI_PAGE_ASSISTANT_IDX) {
+            if (now_touch && ty >= BODY_TOP) {
+                ui_page_assistant_touch(tx, ty, edge);
+            }
         }
 
         prev_touch = now_touch;
@@ -658,8 +676,10 @@ static void ui_task(void *arg)
             tab_draw_one(s_active_page,  true);
             if (s_active_page < EFFECT_COUNT) {
                 page_body_redraw(&s_pages[s_active_page]);
-            } else {
+            } else if (s_active_page == UI_PAGE_RECORD_IDX) {
                 record_page_body_redraw();
+            } else {
+                assistant_page_body_redraw();
             }
             displayed_page = s_active_page;
         } else if (displayed_page < EFFECT_COUNT) {
@@ -676,8 +696,10 @@ static void ui_task(void *arg)
             for (uint8_t i = 0; i < p->slider_count; i++) {
                 slider_draw(&p->sliders[i]);
             }
-        } else {
+        } else if (displayed_page == UI_PAGE_RECORD_IDX) {
             ui_page_record_tick();
+        } else {
+            ui_page_assistant_tick();
         }
     }
 }
