@@ -1742,11 +1742,14 @@ void StartDefaultTask(void *argument)
   sd_card_init();
   recorder_init();
   player_init();
-  /* wake_word_init spawns the wake-word task; must run AFTER audio_init so
-     the decimator (fed from the audio task) is producing samples by the time
-     the wake-word task starts polling decimator_ring. */
-  wake_word_init();
+  /* ui_init must run BEFORE wake_word_init even though wake_word_init only
+     needs audio_init's decimator to be live. heap_4 is 32 KB and the per-task
+     stacks plus TCBs total ~31 KB by the time wake_word_init lands; spawning
+     it last would leave xTaskCreate for the UI task unable to allocate and
+     fail silently, blanking the screen. The wake-word task tolerates an
+     already-running UI just fine. */
   ui_init();
+  wake_word_init();
 
   for(;;)
   {

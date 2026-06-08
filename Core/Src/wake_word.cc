@@ -391,7 +391,11 @@ extern "C" void wake_word_init(void)
     /* Init succeeded. wake_word_init_status will tick up to mirror
        wake_word_total_inferences as soon as the task starts producing. */
 
-    BaseType_t ok = xTaskCreate(wake_word_task, "WakeWord", 1024, NULL,
+    /* 512 words = 2 KB stack. TFLM's working memory lives in the SDRAM arena
+       (s_arena), not on the task stack; Invoke's stack usage is dominated by
+       a handful of conv kernel locals plus the recursive interpreter
+       dispatch. 2 KB has measured fine; heap_4 is too tight to budget more. */
+    BaseType_t ok = xTaskCreate(wake_word_task, "WakeWord", 512, NULL,
                                 tskIDLE_PRIORITY + 2, NULL);
     if (ok != pdPASS) {
         wake_word_init_status = -7;
