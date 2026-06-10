@@ -119,7 +119,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/ui_page_record.c
     Core/Src/ui_page_assistant.c
     Core/Src/decimator.c
-    Core/Src/mel_fbank.c
+    Core/Src/micro_features.c
+    Core/Src/feature_dump.c
     Core/Src/wake_word.cc
     Core/Src/tflm_glue.cc
     # Build-time-generated model data array. The custom command above produces

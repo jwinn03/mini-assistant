@@ -37,7 +37,8 @@
 #include "player.h"
 #include "tflm_glue.h"
 #include "decimator.h"
-#include "mel_fbank.h"
+#include "micro_features.h"
+#include "feature_dump.h"
 #include "wake_word.h"
 /* USER CODE END Includes */
 
@@ -232,8 +233,11 @@ int main(void)
   /* USER CODE BEGIN 2 */
   dsp_init();
   decimator_init();                             /* Phase 6 step 4: 48->16 kHz mono path. */
-  mel_fbank_init();                             /* Phase 6 step 5: log-mel front end. */
-  mel_fbank_selftest(1000.0f);                  /*   one-shot 1 kHz sine through the pipeline. */
+  micro_features_init();                        /* Phase 6.5: microfrontend feature pipeline.
+                                                   Mallocs ~10 KB of state tables from the
+                                                   newlib heap — runs pre-scheduler on purpose
+                                                   so no malloc locking is ever needed. */
+  feature_dump_init();                          /* Phase 6.5: verification capture, armed at boot. */
   tflm_glue_nop();                              /* Phase 6 step 1 canary (kept). */
   tflm_canary_result = tflm_glue_canary();      /* Phase 6 step 3 canary: real TFLM inference. */
   /* USER CODE END 2 */

@@ -7,14 +7,19 @@
 extern "C" {
 #endif
 
-/* Phase 6 step 6 — TFLM-driven wake-word recognizer.
+/* Phase 6.5 — TFLM-driven wake-word recognizer, training-matched front end.
 
-   wake_word_init() spawns a low-priority FreeRTOS task that pulls 30 ms
-   windows from decimator_ring at the 20 ms hop rate, runs mel_fbank_process
-   for features, feeds those into a static MicroInterpreter, and looks for
-   sustained high confidence on the model output. A successful wake fires
-   asynchronously via the trigger globals below — Phase 7 will replace that
-   poll-based signal with a FreeRTOS event group bit. */
+   wake_word_init() spawns a low-priority FreeRTOS task that pulls 10 ms hops
+   from decimator_ring, runs them through the audio microfrontend
+   (micro_features.h — the int16 pipeline microWakeWord trains against), and
+   feeds 3 fresh feature frames per Invoke into a static MicroInterpreter
+   (one inference per 30 ms). Detection = mean of the last 5 probabilities
+   above the model's cutoff. A successful wake fires asynchronously via the
+   trigger globals below — Phase 7 will replace that poll-based signal with
+   a FreeRTOS event group bit.
+
+   Requires micro_features_init() to have succeeded (called from main()
+   before the scheduler starts); otherwise init bails with status -8. */
 
 void wake_word_init(void);
 
@@ -32,6 +37,11 @@ extern volatile uint32_t wake_word_last_inference_cycles;
    boot (mirrors wake_word_total_inferences). Negative values are init
    failures with the code matching wake_word.cc internal sentinels. */
 extern volatile int32_t wake_word_init_status;
+
+/* Times the wake task fell a full decimator ring (~64 ms) behind and had to
+   skip ahead. Nonzero during normal operation means the task is being
+   starved; nonzero during a feature-dump capture invalidates the dump. */
+extern volatile uint32_t wake_word_ring_overruns;
 
 /* Diagnostic: at init we walk the model's operator_codes table and copy each
    builtin code into wake_word_model_ops[]. Cross-reference with the

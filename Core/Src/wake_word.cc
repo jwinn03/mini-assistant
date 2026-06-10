@@ -1,15 +1,23 @@
-/* Phase 6 step 6 — wake-word recognizer task.
+/* Phase 6.5 — wake-word recognizer task, training-matched front end.
 
-   Pulls 30 ms windows from decimator_ring on a 20 ms hop, runs them through
-   the mel-fbank front end built in step 5, and feeds the resulting 40-element
-   feature vector into a microMutableOpResolver-backed MicroInterpreter loaded
-   with the V2 hey_jarvis streaming model.
+   Pulls 10 ms hops (160 samples) from decimator_ring, feeds them through the
+   TFLM audio microfrontend (micro_features.c — the exact int16 pipeline
+   microWakeWord trains against), and stages each resulting uint16[40] frame
+   into the model input. The V2 hey_jarvis streaming model takes 3 FRESH
+   frames per Invoke (input (1, 3, 40)) and runs every 30 ms — its initial
+   conv layer strides over the 3 slices while resource variables carry the
+   longer-term context. Feeding overlapping (sliding) frames corrupts that
+   internal state; that and the unmatched float log-mel front end were why
+   the Phase 6 version never fired.
 
-   The model is sensitive to its training-time feature scaling — natural log
-   vs log10, dB offset, normalisation. Our front end matches the most common
-   convention; the model will still run with a mismatch but produce poor
-   confidences. The intended remediation is the Phase 6 plan's "step 5
-   offline Python comparison" — out of scope for this step. */
+   Feature scaling: the model was trained on microfrontend output / 25.6
+   (float range ~[0, 26]); ESPHome ships the same arithmetic fused into int8
+   space as (x * 256) / 666 - 128. We scale to float and let
+   feed_features_to_input() quantize with the input tensor's published
+   scale/zero-point.
+
+   Trigger policy follows the hey_jarvis V2 manifest: mean of the last 5
+   inference probabilities > 0.97, then a ~1 s refractory. */
 
 #include "wake_word.h"
 
@@ -20,7 +28,8 @@
 #include "stm32f7xx.h"        /* DWT for cycle measurement of Invoke() */
 
 #include "decimator.h"
-#include "mel_fbank.h"
+#include "micro_features.h"
+#include "feature_dump.h"
 #include "hey_jarvis_model_data.h"
 
 #include "tensorflow/lite/micro/micro_interpreter.h"
@@ -36,6 +45,7 @@ extern "C" volatile float    wake_word_last_confidence       = 0.0f;
 extern "C" volatile uint32_t wake_word_total_fires           = 0;
 extern "C" volatile uint32_t wake_word_last_inference_cycles = 0;
 extern "C" volatile int32_t  wake_word_init_status           = 0;
+extern "C" volatile uint32_t wake_word_ring_overruns         = 0;
 
 /* Diagnostic globals (see wake_word.h). */
 extern "C" volatile uint8_t  wake_word_model_op_count   = 0;
@@ -59,12 +69,13 @@ extern "C" volatile int32_t  wake_word_output_zero_point = 0;
 
 namespace {
 
-/* Trigger policy — keep close to the plan's 0.95 + ≥3 frames + 200 ms
-   cooldown. Confidence floats and the threshold is a float so we can tune
-   per model. */
-constexpr float    kThreshold       = 0.95f;
-constexpr uint32_t kMinConsecutive  = 3u;
-constexpr uint32_t kCooldownFrames  = 10u;   /* 10 * 20 ms = 200 ms */
+/* Trigger policy — from the hey_jarvis V2 manifest (probability_cutoff 0.97,
+   sliding_window_size 5). Fire when the mean of the last 5 inference
+   probabilities exceeds the cutoff, then hold off ~1 s (refractory) so one
+   utterance can't double-fire. All tunable per model. */
+constexpr float    kProbabilityCutoff    = 0.97f;
+constexpr uint32_t kSlidingWindow        = 5u;
+constexpr uint32_t kRefractoryInferences = 33u;   /* 33 * 30 ms ≈ 1 s */
 
 /* TFLM arena lives in SDRAM (.sdram section, MPU region 1 = write-through
    cacheable, no maintenance needed). 80 KB gives generous slack so we can
@@ -79,13 +90,17 @@ static uint8_t s_arena[kArenaSize];
    (the arena absorbs unused ones for free). */
 constexpr int kMaxResourceVariables = 24;
 
-/* The V2 hey_jarvis model expects a stack of the 3 most-recent mel feature
-   frames as input (3 * 40 = 120 elements). The model also maintains
-   longer-term state via TF Lite resource variables (CALL_ONCE / VAR_HANDLE
-   etc. in the op list). If the chosen wake-word model uses a different
-   stack depth, init bails with -6 and you set kFrameHistory accordingly. */
-constexpr uint32_t kFrameHistory   = 3u;
-constexpr uint32_t kInputElements  = kFrameHistory * MEL_FBANK_N_MELS;
+/* The V2 hey_jarvis model takes 3 FRESH feature frames per Invoke — input
+   shape (1, 3, 40), 120 int8 elements, one inference per 30 ms of audio.
+   Longer-term context lives inside the model in TF Lite resource variables
+   (CALL_ONCE / VAR_HANDLE etc. in the op list). If a future model uses a
+   different stride, init bails with -6 and kStride changes here. */
+constexpr uint32_t kStride         = 3u;
+constexpr uint32_t kInputElements  = kStride * MICRO_FEATURES_N_CHANNELS;
+
+/* uint16 microfrontend output -> the float feature domain the model was
+   trained on. See the file header for the ESPHome int8 equivalence. */
+constexpr float    kFeatureScale   = 1.0f / 25.6f;
 
 /* Op resolver — superset of what microWakeWord V2 models are known to use.
    Each registration is ~1 KB of FLASH that --gc-sections cannot strip; if
@@ -101,15 +116,20 @@ WakeOpResolver                   s_resolver;
 alignas(tflite::MicroInterpreter)
 static uint8_t s_interp_storage[sizeof(tflite::MicroInterpreter)];
 
-/* Sliding state for the task loop. */
-int16_t s_window[MEL_FBANK_WIN_SIZE];
-float   s_features[MEL_FBANK_N_MELS];
-/* Stack of the most-recent kFrameHistory mel frames. Layout: oldest at
-   offset 0, newest at offset (kFrameHistory - 1) * MEL_FBANK_N_MELS. */
+/* Task-loop state. One hop of decimator output, the most recent feature
+   frame, and the 3-frame staging buffer the input tensor is filled from
+   (slot s_stride_step * 40; oldest frame at offset 0). */
+int16_t  s_hop[MICRO_FEATURES_HOP_SAMPLES];
+uint16_t s_frame[MICRO_FEATURES_N_CHANNELS];
 __attribute__((section(".audio_buffers")))
 float    s_feature_stack[kInputElements];
-uint32_t s_consecutive_above  = 0;
-uint32_t s_cooldown_remaining = 0;
+uint32_t s_stride_step = 0;
+
+/* Trigger state: ring of the last kSlidingWindow probabilities. */
+float    s_recent[kSlidingWindow];
+uint32_t s_recent_idx          = 0;
+uint32_t s_recent_count        = 0;
+uint32_t s_refractory_remaining = 0;
 
 TfLiteStatus register_ops(WakeOpResolver& r)
 {
@@ -208,70 +228,91 @@ float read_output_confidence()
 
 void update_trigger(float confidence)
 {
-    if (s_cooldown_remaining > 0) {
-        s_cooldown_remaining--;
-        s_consecutive_above = 0;
+    if (s_refractory_remaining > 0) {
+        s_refractory_remaining--;
         return;
     }
-    if (confidence > kThreshold) {
-        s_consecutive_above++;
-        if (s_consecutive_above >= kMinConsecutive) {
-            wake_word_total_fires++;
-            s_consecutive_above  = 0;
-            s_cooldown_remaining = kCooldownFrames;
-        }
-    } else {
-        s_consecutive_above = 0;
+
+    s_recent[s_recent_idx] = confidence;
+    s_recent_idx = (s_recent_idx + 1u) % kSlidingWindow;
+    if (s_recent_count < kSlidingWindow) {
+        s_recent_count++;
+        return;   /* don't evaluate until the window is full */
+    }
+
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < kSlidingWindow; i++) {
+        sum += s_recent[i];
+    }
+    if (sum > kProbabilityCutoff * (float)kSlidingWindow) {
+        wake_word_total_fires++;
+        s_recent_idx           = 0;
+        s_recent_count         = 0;
+        s_refractory_remaining = kRefractoryInferences;
     }
 }
 
 void wake_word_task(void* /*arg*/)
 {
-    /* Wait for enough decimator samples to form one full window. */
-    while (decimator_head < MEL_FBANK_WIN_SIZE) {
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-    uint32_t window_start = decimator_head - MEL_FBANK_WIN_SIZE;
+    /* Start at "now" — the frontend buffers its own 30 ms window internally,
+       so the first feature frame appears after three hops. */
+    uint32_t read_pos = decimator_head;
 
     for (;;) {
-        /* Block until the next window's worth of new samples is available. */
-        const uint32_t window_end = window_start + MEL_FBANK_WIN_SIZE;
-        while ((int32_t)(decimator_head - window_end) < 0) {
+        /* Debugger-requested feature-dump recapture: reset the frontend and
+           all staging/trigger state so the device and the Python reference
+           both start from frame 0 of a fresh pipeline. */
+        if (feature_dump_take_rearm()) {
+            micro_features_reset();
+            s_stride_step  = 0;
+            s_recent_idx   = 0;
+            s_recent_count = 0;
+        }
+
+        /* Block until a full hop of new samples is available. */
+        while ((int32_t)(decimator_head - (read_pos + MICRO_FEATURES_HOP_SAMPLES)) < 0) {
             vTaskDelay(pdMS_TO_TICKS(5));
         }
 
-        /* Copy window from the ring (handle wraparound via mask). */
-        for (uint32_t i = 0; i < MEL_FBANK_WIN_SIZE; i++) {
-            s_window[i] = decimator_ring[(window_start + i) & DECIMATOR_RING_MASK];
+        /* If we fell more than a ring behind (UI hogging the CPU, debugger
+           halt), the unread samples are already overwritten. Jump to the
+           freshest full hop. The frontend sees a seam — harmless for
+           detection, fatal for a feature-dump capture in flight. */
+        if (decimator_head - read_pos > DECIMATOR_RING_SIZE) {
+            read_pos = decimator_head - MICRO_FEATURES_HOP_SAMPLES;
+            wake_word_ring_overruns++;
+            feature_dump_mark_invalid();
         }
 
-        mel_fbank_process(s_window, s_features);
-
-        /* Crude bridge between our log-mel features and what microWakeWord's
-           audio_microfrontend would produce. The model expects features in
-           ~[0, 26]; ours land in ~[-14, +8]. A constant offset of +14 makes
-           the floor non-negative; the clip keeps quiet bins from going
-           further below. This does NOT match the training-time front end
-           (PCAN + smoothing + log-shift) and exists only to prove the model
-           responds to input. Replacing this with a faithful audio_microfrontend
-           port is the proper Phase-6-completion task. */
-        for (uint32_t i = 0; i < MEL_FBANK_N_MELS; i++) {
-            float v = s_features[i] + 14.0f;
-            if (v < 0.0f) v = 0.0f;
-            s_features[i] = v;
+        for (uint32_t i = 0; i < MICRO_FEATURES_HOP_SAMPLES; i++) {
+            s_hop[i] = decimator_ring[(read_pos + i) & DECIMATOR_RING_MASK];
         }
+        /* Re-check after the copy: if the audio task lapped us mid-copy,
+           part of s_hop is freshly overwritten data. Detection just hears
+           a glitch; a feature-dump capture in flight must be discarded. */
+        if (decimator_head - read_pos > DECIMATOR_RING_SIZE) {
+            wake_word_ring_overruns++;
+            feature_dump_mark_invalid();
+        }
+        read_pos += MICRO_FEATURES_HOP_SAMPLES;
 
-        /* Shift the feature stack one frame older and append the new one at
-           the end. Net effect: stack always holds the most-recent
-           kFrameHistory frames, oldest at offset 0. Until kFrameHistory
-           frames have actually been produced (~60 ms after boot), the
-           leading frames are zero — accepted as a brief warm-up artefact. */
-        memmove(&s_feature_stack[0],
-                &s_feature_stack[MEL_FBANK_N_MELS],
-                (kInputElements - MEL_FBANK_N_MELS) * sizeof(float));
-        memcpy(&s_feature_stack[kInputElements - MEL_FBANK_N_MELS],
-               s_features,
-               MEL_FBANK_N_MELS * sizeof(float));
+        feature_dump_pcm(s_hop, MICRO_FEATURES_HOP_SAMPLES);
+
+        if (!micro_features_process_hop(s_hop, s_frame)) {
+            continue;   /* 30 ms window still priming (first two hops) */
+        }
+        feature_dump_frame(s_frame);
+
+        /* Stage the frame into the next stride slot, scaled into the float
+           feature domain the model was trained on. */
+        float *slot = &s_feature_stack[s_stride_step * MICRO_FEATURES_N_CHANNELS];
+        for (uint32_t i = 0; i < MICRO_FEATURES_N_CHANNELS; i++) {
+            slot[i] = (float)s_frame[i] * kFeatureScale;
+        }
+        if (++s_stride_step < kStride) {
+            continue;   /* model wants kStride fresh frames per Invoke */
+        }
+        s_stride_step = 0;
 
         feed_features_to_input();
         const uint32_t t0 = DWT->CYCCNT;
@@ -285,8 +326,6 @@ void wake_word_task(void* /*arg*/)
             wake_word_init_status = (int32_t)wake_word_total_inferences;
             update_trigger(c);
         }
-
-        window_start += MEL_FBANK_HOP_SIZE;
     }
 }
 
@@ -294,6 +333,14 @@ void wake_word_task(void* /*arg*/)
 
 extern "C" void wake_word_init(void)
 {
+    /* The microfrontend is initialised from main() before the scheduler
+       starts (its state tables come from the newlib heap). Without it the
+       task has nothing to feed the model. */
+    if (micro_features_init_status != 1) {
+        wake_word_init_status = -8;
+        return;
+    }
+
     const tflite::Model* model = ::tflite::GetModel(hey_jarvis_tflite);
     if (model->version() != TFLITE_SCHEMA_VERSION) {
         wake_word_init_status = -1;
@@ -371,8 +418,8 @@ extern "C" void wake_word_init(void)
         }
     }
 
-    /* Smoke-check: confirm input geometry matches our kFrameHistory * 40
-       stacked feature vector. */
+    /* Smoke-check: confirm input geometry matches our kStride * 40
+       staged feature buffer. */
     if (s_interpreter->input(0)->dims->size > 0) {
         uint32_t in_elems = 1;
         for (int d = 0; d < s_interpreter->input(0)->dims->size; d++) {
@@ -384,8 +431,8 @@ extern "C" void wake_word_init(void)
         }
     }
 
-    /* Zero the feature stack so the first kFrameHistory invocations see
-       silence padding ahead of any real audio. */
+    /* Hygiene only — all kStride slots are refilled with fresh frames
+       before every Invoke, so no zero-padding is ever fed to the model. */
     memset(s_feature_stack, 0, sizeof(s_feature_stack));
 
     /* Init succeeded. wake_word_init_status will tick up to mirror

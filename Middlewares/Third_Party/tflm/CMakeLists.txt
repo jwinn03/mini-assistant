@@ -14,6 +14,19 @@
 # revisions. If TFLM updates its bundled CMSIS-NN to use new APIs and we hit a
 # mismatch, the fix is to pin our standalone CMSIS-NN to the same commit
 # TFLM uses (currently 6d9d61d8 per third_party_downloads).
+#
+# Audio microfrontend (Phase 6.5): tensorflow/lite/experimental/microfrontend/lib
+# was NOT part of the create_tflm_tree.py extraction — it was added afterwards by
+# copying the runtime + util sources (34 files, no tests) from upstream
+# tflite-micro main. They sit at the canonical tree path so the source glob below
+# picks them up and their own `#include "tensorflow/lite/experimental/..."`
+# directives resolve via the existing root include dir. The int16 kissfft they
+# wrap (kiss_fft_int16.{h,cc}) textually includes kiss_fft.c / tools/kiss_fftr.c
+# by bare name, which needs third_party/kissfft on the include path (PRIVATE
+# below — kissfft never leaks into public headers).
+#
+# NOTE: file(GLOB) runs at configure time. Adding/removing microfrontend files
+# requires touching this CMakeLists (or re-running CMake) for the glob to refresh.
 
 cmake_minimum_required(VERSION 3.15)
 
@@ -61,6 +74,13 @@ target_include_directories(tflm PUBLIC
     # already (which works for `<arm_nnfunctions.h>` style), so we add the
     # root here for the TFLM-style include. Single CMSIS-NN tree, two paths.
     "${CMAKE_SOURCE_DIR}/Middlewares/Third_Party/CMSIS-NN"
+)
+
+# kissfft root for the microfrontend's int16 FFT wrapper (see header comment).
+# PRIVATE: only kiss_fft_int16.{h,cc} / fft(_util).cc reach for these headers,
+# and all of them compile inside this target.
+target_include_directories(tflm PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/kissfft"
 )
 
 # TFLM-required compile defines.
