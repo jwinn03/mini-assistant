@@ -35,6 +35,18 @@ extern "C" {
    samples mid-capture; the dump no longer matches the frontend's true input
    stream. Discard and rearm. */
 
+/* OFF by default. Live detection works without the bit-exact feature check,
+   so this is a troubleshooting tool, not a normal-operation feature. Disabled,
+   the 400 KB .sdram capture buffers are never allocated and every hook below
+   compiles to a no-op (the wake task's call sites cost nothing). Flip to 1 and
+   rebuild to capture for tools/compare_features.py — see CLAUDE.md, Phase 6.5
+   "Deferred verification" for the full workflow. */
+#ifndef FEATURE_DUMP_ENABLED
+#define FEATURE_DUMP_ENABLED 0
+#endif
+
+#if FEATURE_DUMP_ENABLED
+
 #define FEATURE_DUMP_PCM_CAPACITY    160000u  /* 10 s @ 16 kHz, 320 KB        */
 #define FEATURE_DUMP_FRAME_CAPACITY  1000u    /* >= 998 frames from 10 s      */
 
@@ -59,6 +71,17 @@ extern volatile uint32_t feature_dump_rearm;     /* set to 1 to recapture */
 
 extern int16_t  feature_dump_pcm_buf[FEATURE_DUMP_PCM_CAPACITY];
 extern uint16_t feature_dump_frame_buf[FEATURE_DUMP_FRAME_CAPACITY][40];
+
+#else  /* !FEATURE_DUMP_ENABLED — every hook becomes a no-op */
+
+static inline void feature_dump_init(void) {}
+static inline void feature_dump_pcm(const int16_t *samples, uint32_t n) { (void)samples; (void)n; }
+static inline void feature_dump_frame(const uint16_t *feat) { (void)feat; }
+static inline int  feature_dump_capturing(void) { return 0; }
+static inline int  feature_dump_take_rearm(void) { return 0; }
+static inline void feature_dump_mark_invalid(void) {}
+
+#endif /* FEATURE_DUMP_ENABLED */
 
 #ifdef __cplusplus
 }

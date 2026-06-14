@@ -78,10 +78,13 @@ constexpr uint32_t kSlidingWindow        = 5u;
 constexpr uint32_t kRefractoryInferences = 33u;   /* 33 * 30 ms ≈ 1 s */
 
 /* TFLM arena lives in SDRAM (.sdram section, MPU region 1 = write-through
-   cacheable, no maintenance needed). 80 KB gives generous slack so we can
-   rule out arena-too-small as a cause of AllocateTensors failure when
-   diagnosing missing ops. */
-constexpr uint32_t kArenaSize       = 80u * 1024u;
+   cacheable, no maintenance needed). Right-sized to 32 KB after Phase 6.5
+   confirmed AllocateTensors uses ~17.8 KB (arena_used_bytes(), also surfaced
+   in wake_word_arena_used) and the V2 manifest's tensor_arena_size is 22.9 KB.
+   32 KB keeps comfortable margin over both; was 80 KB during bring-up to rule
+   out arena-too-small while diagnosing missing ops. If a model swap pushes
+   wake_word_arena_used near this, bump it back up. */
+constexpr uint32_t kArenaSize       = 32u * 1024u;
 __attribute__((section(".sdram"), aligned(16)))
 static uint8_t s_arena[kArenaSize];
 

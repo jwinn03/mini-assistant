@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+#if FEATURE_DUMP_ENABLED
+
 /* Both buffers live in .sdram (NOLOAD — contents undefined at reset). That's
    fine without a memset: readers only consume entries below the counters,
    and the counters are .bss / reset by feature_dump_init. ~400 KB of the
@@ -79,3 +81,5 @@ void feature_dump_mark_invalid(void)
         feature_dump_invalid = 1;
     }
 }
+
+#endif /* FEATURE_DUMP_ENABLED */
