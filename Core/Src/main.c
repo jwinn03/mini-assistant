@@ -40,6 +40,7 @@
 #include "micro_features.h"
 #include "feature_dump.h"
 #include "wake_word.h"
+#include "utterance.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -124,7 +125,12 @@ SDRAM_HandleTypeDef hsdram1;
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 4096 * 4,
+  /* Reclaimed from 4096 to 2048 words (frees ~8 KB of heap_4) to make room for
+     the Phase 7 utterance task — heap_4 was ~1 KB free. This stack only has to
+     survive StartDefaultTask's init chain (deepest user is wake_word_init's
+     TFLM AllocateTensors) before the loop drops to osDelay(1000) forever; 2048
+     words keeps margin there. Verify with uxTaskGetStackHighWaterMark. */
+  .stack_size = 2048 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* USER CODE BEGIN PV */
@@ -1753,6 +1759,11 @@ void StartDefaultTask(void *argument)
      fail silently, blanking the screen. The wake-word task tolerates an
      already-running UI just fine. */
   ui_init();
+  /* utterance_init() spawns the Phase 7 VAD/capture task — a second consumer
+     of the decimator ring. Created before wake_word_init() so the wake-word
+     task stays last per the heap-order rule (a later xTaskCreate that runs out
+     of heap_4 fails silently). */
+  utterance_init();
   wake_word_init();
 
   for(;;)
