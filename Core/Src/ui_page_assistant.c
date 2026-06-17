@@ -2,6 +2,7 @@
 #include "lcd.h"
 #include "wake_word.h"
 #include "utterance.h"
+#include "vad.h"
 #include <stdbool.h>
 #include <string.h>
 
@@ -26,6 +27,11 @@
    tally, above the wake-word indicator dot. */
 #define STATE_Y            72
 #define CAPMETA_Y          100
+
+/* VAD tuning aid: live frame energy vs. adaptive noise floor. Slots just below
+   the indicator dot (130..154). Temporary — drop once VAD_ABS_OFFSET is dialed
+   in. */
+#define VAD_Y              158
 
 #define COL_BG             0x0000          /* LCD_BLACK */
 #define COL_FG             0xFFFF          /* LCD_WHITE */
@@ -59,6 +65,10 @@ static uint32_t s_drawn_caps        = 0xFFFFFFFFu;
 static uint32_t s_drawn_rejs        = 0xFFFFFFFFu;
 static uint8_t  s_reject_flash      = 0;     /* "Rejected" overlay countdown */
 static uint32_t s_last_seen_rejects = 0;
+
+/* VAD tuning-aid render cache. */
+static uint32_t s_drawn_energy      = 0xFFFFFFFFu;
+static uint32_t s_drawn_floor       = 0xFFFFFFFFu;
 
 /* ----- tiny formatting helpers (no libm) -------------------------------- */
 
@@ -201,6 +211,18 @@ void ui_page_assistant_redraw(void)
         s_drawn_rejs = utterance_total_rejects;
     }
 
+    /* VAD energy / floor tuning line. */
+    {
+        char m[48];
+        int n = put_str(m, 0, "E:");
+        n += emit_u32(vad_last_energy, m + n);
+        n  = put_str(m, n, " F:");
+        n += emit_u32(vad_noise_floor, m + n);
+        draw_row(VAD_Y, m, COL_FG);
+        s_drawn_energy = vad_last_energy;
+        s_drawn_floor  = vad_noise_floor;
+    }
+
     draw_indicator((s_flash_remaining > 0) ||
                    (utterance_state == UTTERANCE_STATE_ACTIVE));
 
@@ -273,6 +295,23 @@ void ui_page_assistant_tick(void)
         draw_row(CAPMETA_Y, m, COL_FG);
         s_drawn_caps = utterance_total_captures;
         s_drawn_rejs = rejs_now;
+    }
+
+    /* VAD energy / floor — live tuning aid. Energy changes every frame while
+       you speak; delta-compare so a quiet room doesn't churn the panel. */
+    {
+        uint32_t e  = vad_last_energy;
+        uint32_t fl = vad_noise_floor;
+        if (e != s_drawn_energy || fl != s_drawn_floor) {
+            char m[48];
+            int n = put_str(m, 0, "E:");
+            n += emit_u32(e, m + n);
+            n  = put_str(m, n, " F:");
+            n += emit_u32(fl, m + n);
+            draw_row(VAD_Y, m, COL_FG);
+            s_drawn_energy = e;
+            s_drawn_floor  = fl;
+        }
     }
 
     /* Diagnostic updates — delta-only so the LCD doesn't churn when nothing

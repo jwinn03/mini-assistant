@@ -14,9 +14,12 @@
    Energy is mean-square, so a factor of 8 is ~+9 dB over the ambient floor —
    enough to clear room noise without missing soft speech. OFFSET is an
    absolute gate so that in a near-silent room (floor ≈ 0) random low-level
-   noise still can't trip the detector. ~RMS 320 of 32767 full-scale. */
+   noise still can't trip the detector. ~RMS 173 of 32767 full-scale — a
+   deliberately forgiving starting point. Watch vad_last_energy on the Assist
+   tab while speaking to calibrate: set OFFSET between the quiet-room energy
+   and your speaking-energy. */
 #define VAD_MARGIN_NUM    8u
-#define VAD_ABS_OFFSET    100000u
+#define VAD_ABS_OFFSET    30000u
 
 /* Zero-crossing upper bound (out of VAD_FRAME_LEN-1 = 319 possible). Voiced
    and most unvoiced speech sit well under this; near-saturating broadband
@@ -35,10 +38,11 @@ static uint32_t s_floor;            /* working copy of the adaptive floor */
 
 void vad_reset(void)
 {
-    /* Start the floor at the absolute gate rather than 0 so the first ~second
-       (before the integrator settles) behaves like a fixed-threshold VAD. */
-    s_floor          = VAD_ABS_OFFSET;
-    vad_noise_floor  = s_floor;
+    /* Start the floor at 0 so the cold-start threshold is just VAD_ABS_OFFSET
+       (a clean fixed gate). Seeding it at the offset instead made the initial
+       threshold floor×MARGIN + OFFSET = 9×OFFSET — far too high. */
+    s_floor          = 0;
+    vad_noise_floor  = 0;
     vad_last_energy  = 0;
     vad_last_zcr     = 0;
 }
@@ -78,13 +82,21 @@ bool vad_is_speech(const int16_t *frame, bool adapt_floor)
     bool loud   = ((uint64_t)energy > thresh);
     bool speech = loud && (zcr <= VAD_ZCR_MAX);
 
-    /* Adapt the floor only while the caller permits it (ARMED). Folding the
-       energy in while the speaker is talking (ACTIVE) would let the floor
-       chase the voice and prematurely end the utterance. Signed update so the
-       floor can fall as well as rise. */
+    /* Adapt the floor only while the caller permits it (ARMED). The update is
+       asymmetric so that speech — including the wake word itself — can never
+       inflate the floor:
+         - energy below the floor: always track down (a sub-floor frame can't
+           be speech, so the talker can't fool this), finding true ambient.
+         - energy above the floor: only fold in NON-speech frames. Letting
+           loud speech raise the floor was the bug — an inflated floor × MARGIN
+           pushed the ACTIVE threshold above the command's own level, so every
+           capture saw zero speech and got rejected. */
     if (adapt_floor) {
-        int64_t diff = (int64_t)energy - (int64_t)s_floor;
-        s_floor = (uint32_t)((int64_t)s_floor + (diff >> VAD_FLOOR_SHIFT));
+        if (energy < s_floor) {
+            s_floor -= (s_floor - energy) >> VAD_FLOOR_SHIFT;
+        } else if (!speech) {
+            s_floor += (energy - s_floor) >> VAD_FLOOR_SHIFT;
+        }
         vad_noise_floor = s_floor;
     }
 
