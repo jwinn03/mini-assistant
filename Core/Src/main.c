@@ -134,7 +134,12 @@ const osThreadAttr_t defaultTask_attributes = {
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* USER CODE BEGIN PV */
-
+/* Minimum free stack (in BYTES) ever seen on defaultTask, sampled in
+   StartDefaultTask. Read this in the debugger instead of calling
+   uxTaskGetStackHighWaterMark() directly — that's a function call the ST-Link
+   GDB server won't evaluate from the watch window. Confirms the 4096 → 2048
+   word reclaim left margin; want a comfortably positive value. */
+volatile uint32_t g_defaultTask_free_bytes = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -289,7 +294,7 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-
+    vTaskDelay(1000);  
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
@@ -1766,8 +1771,14 @@ void StartDefaultTask(void *argument)
   utterance_init();
   wake_word_init();
 
+  /* Sample the stack high-water mark right after the init chain (its deepest
+     user is wake_word_init's TFLM AllocateTensors), then keep it fresh each
+     loop. osThreadGetStackSpace returns the minimum free stack in bytes. */
+  g_defaultTask_free_bytes = osThreadGetStackSpace(osThreadGetId());
+
   for(;;)
   {
+    g_defaultTask_free_bytes = osThreadGetStackSpace(osThreadGetId());
     osDelay(1000);
   }
   /* USER CODE END 5 */
