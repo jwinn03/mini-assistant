@@ -2,9 +2,19 @@
 #include "lcd.h"
 #include "wake_word.h"
 #include "utterance.h"
-#include "vad.h"
 #include <stdbool.h>
 #include <string.h>
+
+/* VAD energy/floor tuning readout (Phase 7 calibration aid). Flip to 1 to
+   restore the live "E:<energy> F:<floor>" line on the Assist tab — handy if the
+   VAD ever needs re-tuning against real mic levels. Disabled now that
+   VAD_ABS_OFFSET / VAD_MARGIN_NUM are dialed in. Gating it (rather than
+   deleting) keeps the code compilable and one flag away from coming back. */
+#define ASSIST_VAD_READOUT 0
+
+#if ASSIST_VAD_READOUT
+#include "vad.h"
+#endif
 
 /* Layout. The body region is y in [BODY_TOP, LCD_H); we just inline the same
    value (40) used elsewhere rather than expose it from ui.c. */
@@ -28,10 +38,11 @@
 #define STATE_Y            72
 #define CAPMETA_Y          100
 
+#if ASSIST_VAD_READOUT
 /* VAD tuning aid: live frame energy vs. adaptive noise floor. Slots just below
-   the indicator dot (130..154). Temporary — drop once VAD_ABS_OFFSET is dialed
-   in. */
+   the indicator dot (130..154). */
 #define VAD_Y              158
+#endif
 
 #define COL_BG             0x0000          /* LCD_BLACK */
 #define COL_FG             0xFFFF          /* LCD_WHITE */
@@ -66,9 +77,11 @@ static uint32_t s_drawn_rejs        = 0xFFFFFFFFu;
 static uint8_t  s_reject_flash      = 0;     /* "Rejected" overlay countdown */
 static uint32_t s_last_seen_rejects = 0;
 
+#if ASSIST_VAD_READOUT
 /* VAD tuning-aid render cache. */
 static uint32_t s_drawn_energy      = 0xFFFFFFFFu;
 static uint32_t s_drawn_floor       = 0xFFFFFFFFu;
+#endif
 
 /* ----- tiny formatting helpers (no libm) -------------------------------- */
 
@@ -211,6 +224,7 @@ void ui_page_assistant_redraw(void)
         s_drawn_rejs = utterance_total_rejects;
     }
 
+#if ASSIST_VAD_READOUT
     /* VAD energy / floor tuning line. */
     {
         char m[48];
@@ -222,6 +236,7 @@ void ui_page_assistant_redraw(void)
         s_drawn_energy = vad_last_energy;
         s_drawn_floor  = vad_noise_floor;
     }
+#endif
 
     draw_indicator((s_flash_remaining > 0) ||
                    (utterance_state == UTTERANCE_STATE_ACTIVE));
@@ -297,6 +312,7 @@ void ui_page_assistant_tick(void)
         s_drawn_rejs = rejs_now;
     }
 
+#if ASSIST_VAD_READOUT
     /* VAD energy / floor — live tuning aid. Energy changes every frame while
        you speak; delta-compare so a quiet room doesn't churn the panel. */
     {
@@ -313,6 +329,7 @@ void ui_page_assistant_tick(void)
             s_drawn_floor  = fl;
         }
     }
+#endif
 
     /* Diagnostic updates — delta-only so the LCD doesn't churn when nothing
        interesting is happening. */
