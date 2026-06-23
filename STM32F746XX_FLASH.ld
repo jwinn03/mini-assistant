@@ -63,10 +63,19 @@ ENTRY(Reset_Handler)
 MEMORY
 {
 DTCM (xrw)     : ORIGIN = 0x20000000, LENGTH = 64K
-SRAM (xrw)     : ORIGIN = 0x20010000, LENGTH = 256K
+SRAM (xrw)     : ORIGIN = 0x20010000, LENGTH = 240K
+ETH_RAM (xrw)  : ORIGIN = 0x2004C000, LENGTH = 16K
 SDRAM (xrw)    : ORIGIN = 0xC0040000, LENGTH = 7M
 FLASH (rx)     : ORIGIN = 0x8000000, LENGTH = 1024K
 }
+
+/* Phase 8: the top 16K of SRAM is carved out as ETH_RAM (0x2004C000..0x2004FFFF),
+   matching MPU region 3 (Normal, non-cacheable — see Core/Src/main.c MPU_Config).
+   The ETH MAC is an AHB1 master that cannot see the Cortex caches, so its DMA
+   descriptors must live in non-cacheable memory. Shrinking SRAM to 240K also moves
+   _estack down to 0x2004C000, giving the system stack a hard ceiling below this
+   window. LwIP RX data buffers (RX_POOL) stay in cacheable .bss — ethernetif.c
+   maintains them explicitly via SCB_InvalidateDCache_by_Addr. */
 
 /* Highest address of the user mode stack */
 _estack = ORIGIN(SRAM) + LENGTH(SRAM);    /* end of SRAM */
@@ -252,6 +261,18 @@ SECTIONS
 
   PROVIDE( __bss_start = __tbss_start );
   PROVIDE( __bss_size = __bss_end - __bss_start );
+
+  /* Phase 8: ETH DMA descriptors in non-cacheable ETH_RAM (MPU region 3).
+     LWIP/Target/ethernetif.c pins DMARxDscrTab / DMATxDscrTab to these sections;
+     they MUST land at 0x2004C000 or ETH DMA and the CPU go incoherent and the
+     RX/TX rings corrupt within seconds. NOLOAD — undefined at reset, driver inits. */
+  .eth_ram (NOLOAD) :
+  {
+    . = ALIGN(4);
+    *(.RxDescripSection)
+    *(.TxDescripSection)
+    . = ALIGN(4);
+  } >ETH_RAM
 
   /* User_heap_stack section, used to check that there is enough RAM left */
   ._user_heap_stack (NOLOAD) :

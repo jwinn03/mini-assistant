@@ -116,6 +116,18 @@
 /*-----------------------------------------------------------------------------*/
 /* USER CODE BEGIN 1 */
 
+/* Phase 8 memory-map reconciliation (kept in a USER CODE block so it survives
+   CubeMX regeneration). CubeMX hardcodes the LwIP heap to 0x20048000, an address
+   our custom STM32F746XX_FLASH.ld does not reserve — it would collide with the
+   newlib heap / descending MSP stack. Undef it so LwIP declares ram_heap[MEM_SIZE]
+   in .bss, placed safely by the linker. MEM_SIZE is set explicitly because opt.h's
+   default (1600 B) is too small to buffer audio TX; tune alongside TCP_SND_BUF /
+   TCP_WND if streaming throughput needs it. This block is processed before opt.h
+   applies its #ifndef defaults, so these overrides win. */
+#undef  LWIP_RAM_HEAP_POINTER
+#undef  MEM_SIZE
+#define MEM_SIZE (12 * 1024)
+
 /* USER CODE END 1 */
 
 #ifdef __cplusplus
