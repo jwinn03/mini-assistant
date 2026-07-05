@@ -41,6 +41,7 @@
 #include "feature_dump.h"
 #include "wake_word.h"
 #include "utterance.h"
+#include "assistant_client.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -1695,6 +1696,11 @@ void StartDefaultTask(void *argument)
      task stays last per the heap-order rule (a later xTaskCreate that runs out
      of heap_4 fails silently). */
   utterance_init();
+  /* assistant_client_init() spawns the Phase 8 network task — the consumer of
+     the utterance buffer (utterance_take/release). Needs MX_LWIP_Init (done
+     above) and utterance_init; created before wake_word_init() so the
+     wake-word task stays the last xTaskCreate per the heap-order rule. */
+  assistant_client_init();
   wake_word_init();
 
   /* Sample the stack high-water mark right after the init chain (its deepest

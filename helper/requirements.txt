@@ -1,0 +1,9 @@
+# Core (always required)
+websockets>=12
+
+# ASR mode (not needed for --echo transport tests)
+numpy
+faster-whisper
+
+# LLM relay (only if OPENAI_BASE_URL is configured)
+requests

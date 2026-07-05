@@ -128,6 +128,13 @@
 #undef  MEM_SIZE
 #define MEM_SIZE (12 * 1024)
 
+/* Phase 8 assistant client: netconn_set_recvtimeout / netconn_set_sendtimeout
+   need these options compiled in. Without a recv timeout, a helper that dies
+   mid-request would block the assistant task forever; with it, the wait is
+   bounded and the task recovers with an error status. */
+#define LWIP_SO_RCVTIMEO 1
+#define LWIP_SO_SNDTIMEO 1
+
 /* USER CODE END 1 */
 
 #ifdef __cplusplus

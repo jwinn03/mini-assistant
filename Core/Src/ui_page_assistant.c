@@ -3,6 +3,7 @@
 #include "wake_word.h"
 #include "utterance.h"
 #include "net.h"
+#include "assistant_client.h"
 #include <stdbool.h>
 #include <string.h>
 
@@ -18,38 +19,46 @@
 #endif
 
 /* Layout. The body region is y in [BODY_TOP, LCD_H); we just inline the same
-   value (40) used elsewhere rather than expose it from ui.c. */
+   value (40) used elsewhere rather than expose it from ui.c.
+
+   Phase 8 rework: the wake indicator moved from centre-screen to the top-right
+   corner and the three diagnostic rows collapsed into one, freeing the middle
+   of the page for the helper-response text area:
+
+     44   "Assistant" title          [dot 444..460]
+     72   state line (Listening / Capturing / Uploading / ...)
+     100  Caps/Rej tally
+     124  response rows (5 x 18 px pitch, 55 chars each)
+     224  compact diag: Inf / Fire / Conf
+     248  network status                                                   */
 #define BODY_TOP_Y         40
 #define TITLE_Y            44
 
-#define INDICATOR_X        ((480 / 2) - 12)
-#define INDICATOR_Y        130
-#define INDICATOR_SIZE     24
+#define INDICATOR_X        444
+#define INDICATOR_Y        44
+#define INDICATOR_SIZE     16
 
 /* 33 ms render tick × 15 = ~495 ms flash duration on each wake-fire. */
 #define FLASH_TICKS        15u
 
-#define DIAG_X             20
-#define DIAG_CONF_Y        180
-#define DIAG_FIRES_Y       210
-#define DIAG_INFER_Y       240
-
-/* Phase 7 capture readouts: the utterance state line and a captures/rejects
-   tally, above the wake-word indicator dot. */
 #define STATE_Y            72
 #define CAPMETA_Y          100
 
+#define RESP_Y0            124
+#define RESP_PITCH         18
+#define RESP_COLS          55          /* (480 - 2*20) / 8 px per char */
 #if ASSIST_VAD_READOUT
-/* VAD tuning aid: live frame energy vs. adaptive noise floor. Slots just below
-   the indicator dot (130..154). */
-#define VAD_Y              158
-/* VAD aid owns the 158 slot; push the network line to the bottom row. */
-#define NET_Y              256
+/* Debug build: the VAD line takes the last response row. */
+#define RESP_ROWS          4
+#define VAD_Y              (RESP_Y0 + 4 * RESP_PITCH)
 #else
-/* Phase 8: network status line in the slot the (disabled) VAD readout freed. */
-#define NET_Y              158
+#define RESP_ROWS          5
 #endif
-#define NET_STR_CAP        40
+
+#define DIAG_X             20
+#define DIAG_Y             224
+#define NET_Y              248
+#define NET_STR_CAP        56
 
 #define COL_BG             0x0000          /* LCD_BLACK */
 #define COL_FG             0xFFFF          /* LCD_WHITE */
@@ -62,13 +71,16 @@
 #define COL_STATE_DONE     0x07FF          /* cyan   — ENDED / captured */
 #define COL_STATE_REJECT   0xFD20          /* orange — too-short reject flash */
 
-/* Phase 8 network status colours. */
+/* Phase 8 network / assistant colours. */
 #define COL_NET_OK         0x07E0          /* green  — DHCP bound, IP shown */
 #define COL_NET_PENDING    0xFFE0          /* yellow — link up, awaiting DHCP */
 #define COL_NET_DOWN       0x8410          /* gray   — no link / no cable */
+#define COL_ASSIST_BUSY    0xFFE0          /* yellow — connecting/uploading */
+#define COL_ASSIST_WAIT    0x07FF          /* cyan   — waiting for helper */
+#define COL_ASSIST_ERR     0xF800          /* red    — round-trip failed */
 
 /* Local state — what we've already rendered, so each 33 ms tick is delta-only.
-   s_drawn_* hold last-painted values; INT32_MAX sentinel forces first draw. */
+   s_drawn_* hold last-painted values; sentinels force the first draw. */
 static uint32_t s_drawn_inferences = 0xFFFFFFFFu;
 static uint32_t s_drawn_fires      = 0xFFFFFFFFu;
 static int32_t  s_drawn_conf_mille = -100000;
@@ -90,8 +102,12 @@ static uint8_t  s_reject_flash      = 0;     /* "Rejected" overlay countdown */
 static uint32_t s_last_seen_rejects = 0;
 
 /* Phase 8 network status render cache (delta-only repaint). */
-static char     s_drawn_net_str[NET_STR_CAP] = { '\x01', '\0' };  /* junk forces first draw */
+static char     s_drawn_net_str[NET_STR_CAP] = { '\x01', '\0' };
 static uint16_t s_drawn_net_col     = 0xFFFE;
+
+/* Phase 8 response render cache: repaint the text area only when a new
+   response lands (seq edge). */
+static uint32_t s_drawn_resp_seq    = 0xFFFFFFFFu;
 
 #if ASSIST_VAD_READOUT
 /* VAD tuning-aid render cache. */
@@ -149,47 +165,72 @@ static int emit_secs(uint32_t ms, char *out)
 }
 
 /* Compose the capture-state line into `out`; returns the colour to draw it in.
-   Honours an active reject-flash overlay, otherwise reflects utterance_state. */
+   Priority: reject flash > live capture > assistant activity > idle states.
+   The assistant statuses slot in when the capture pipeline is quiet — they
+   describe what happened to the capture the user just made. */
 static uint16_t build_state_text(char *out)
 {
     if (s_reject_flash > 0) {
         put_str(out, 0, "Rejected");
         return COL_STATE_REJECT;
     }
-    switch (utterance_state) {
-    case UTTERANCE_STATE_ACTIVE: {
+    if (utterance_state == UTTERANCE_STATE_ACTIVE) {
         int n = put_str(out, 0, "Capturing ");
         emit_secs(utterance_capture_ms, out + n);
         return COL_STATE_CAPTURE;
     }
-    case UTTERANCE_STATE_ENDED: {
+    switch (assistant_status) {
+    case ASSIST_NO_NET:
+        put_str(out, 0, "No network");
+        return COL_NET_DOWN;
+    case ASSIST_CONNECTING:
+        put_str(out, 0, "Connecting...");
+        return COL_ASSIST_BUSY;
+    case ASSIST_UPLOADING:
+        put_str(out, 0, "Uploading...");
+        return COL_ASSIST_BUSY;
+    case ASSIST_WAITING:
+        put_str(out, 0, "Waiting for helper...");
+        return COL_ASSIST_WAIT;
+    case ASSIST_ERROR:
+        put_str(out, 0, "Helper error");
+        return COL_ASSIST_ERR;
+    default:
+        break;
+    }
+    if (utterance_state == UTTERANCE_STATE_ENDED) {
         int n = put_str(out, 0, "Captured ");
         emit_secs(utterance_capture_ms, out + n);
         return COL_STATE_DONE;
     }
-    default:
-        put_str(out, 0, "Listening");
-        return COL_STATE_LISTEN;
-    }
+    put_str(out, 0, "Listening");
+    return COL_STATE_LISTEN;
 }
 
-/* Compose the network status line into `out`; returns the colour to draw it in.
-   "Net: 192.168.1.42" once DHCP-bound, "Net: DHCP..." while waiting on a lease,
-   "Net: link down" with no cable. Reads LwIP netif status via net.c, which is
-   safe to call from the UI task (plain field reads, not socket/netconn API). */
+/* Compose the network status line into `out`; returns the colour to draw it
+   in. "Net: 192.168.1.42  OK: 3  Err: 0" once DHCP-bound, "Net: DHCP..."
+   while waiting on a lease, "Net: link down" with no cable. Reads LwIP netif
+   status via net.c, which is safe from the UI task (plain field reads). */
 static uint16_t build_net_text(char *out)
 {
     int n = put_str(out, 0, "Net: ");
+    uint16_t col;
     if (net_dhcp_bound()) {
-        net_ip_str(out + n, NET_STR_CAP - n);
-        return COL_NET_OK;
+        net_ip_str(out + n, 16);
+        n = (int)strlen(out);
+        col = COL_NET_OK;
+    } else if (net_link_up()) {
+        n = put_str(out, n, "DHCP...");
+        col = COL_NET_PENDING;
+    } else {
+        n = put_str(out, n, "link down");
+        col = COL_NET_DOWN;
     }
-    if (net_link_up()) {
-        put_str(out, n, "DHCP...");
-        return COL_NET_PENDING;
-    }
-    put_str(out, n, "link down");
-    return COL_NET_DOWN;
+    n  = put_str(out, n, "  OK: ");
+    n += emit_u32(assistant_total_ok, out + n);
+    n  = put_str(out, n, "  Err: ");
+    n += emit_u32(assistant_total_errors, out + n);
+    return col;
 }
 
 /* ----- drawing primitives ------------------------------------------------ */
@@ -208,24 +249,68 @@ static void draw_indicator(bool on)
     s_drawn_indicator_on = on;
 }
 
-static void draw_diag_line(uint16_t y, const char *label, const char *value)
+/* Compose + draw the single compact diagnostics row. */
+static void draw_diag(void)
 {
-    /* Wipe the entire row first to clear stale digits when the value shrinks. */
-    lcd_fill_rect(DIAG_X, y, 480 - DIAG_X, 16, COL_BG);
-    char buf[64];
-    int li = 0;
-    while (label[li] && li < 30) { buf[li] = label[li]; li++; }
-    int vi = 0;
-    while (value[vi] && (li + vi) < 60) { buf[li + vi] = value[vi]; vi++; }
-    buf[li + vi] = 0;
-    lcd_draw_text(DIAG_X, y, buf, COL_FG, COL_BG);
+    char m[64];
+    int n = put_str(m, 0, "Inf: ");
+    n += emit_u32(wake_word_total_inferences, m + n);
+    n  = put_str(m, n, "  Fire: ");
+    n += emit_u32(wake_word_total_fires, m + n);
+    n  = put_str(m, n, "  Conf: ");
+    int32_t mille = (int32_t)(wake_word_last_confidence * 1000.0f);
+    emit_milli(mille, m + n);
+    draw_row(DIAG_Y, m, COL_FG);
+    s_drawn_inferences = wake_word_total_inferences;
+    s_drawn_fires      = wake_word_total_fires;
+    s_drawn_conf_mille = mille;
+}
+
+/* Word-wrap assistant_response into the response rows. Repaints the whole
+   area — called only on a response-seq edge (rare), not per tick. Copies the
+   volatile-ish buffer first so a concurrent client write can't shear a row
+   (a torn copy self-heals: seq changes again → redraw). */
+static void draw_response(void)
+{
+    char txt[ASSISTANT_RESPONSE_CAP];
+    strncpy(txt, assistant_response, sizeof(txt) - 1);
+    txt[sizeof(txt) - 1] = 0;
+
+    const char *s = txt;
+    for (int r = 0; r < RESP_ROWS; r++) {
+        uint16_t y = (uint16_t)(RESP_Y0 + r * RESP_PITCH);
+        lcd_fill_rect(DIAG_X, y, 480 - DIAG_X, 16, COL_BG);
+
+        while (*s == ' ') s++;
+        if (*s == 0) continue;
+
+        int rem = (int)strlen(s);
+        int len = (rem <= RESP_COLS) ? rem : RESP_COLS;
+        if (rem > RESP_COLS) {
+            /* Greedy word wrap: back up to the last space in the window. */
+            int brk = len;
+            while (brk > 0 && s[brk] != ' ') brk--;
+            if (brk > 0) len = brk;
+        }
+
+        char row[RESP_COLS + 1];
+        memcpy(row, s, (size_t)len);
+        row[len] = 0;
+        /* Truncation marker if this is the last row and text remains. */
+        if (r == RESP_ROWS - 1 && rem > len && len >= 3) {
+            row[len - 1] = '.'; row[len - 2] = '.'; row[len - 3] = '.';
+        }
+        lcd_draw_text(DIAG_X, y, row, COL_FG, COL_BG);
+        s += len;
+    }
+    s_drawn_resp_seq = assistant_response_seq;
 }
 
 /* ----- public API -------------------------------------------------------- */
 
 void ui_page_assistant_redraw(void)
 {
-    /* Title centred-ish at the top of the body. */
+    /* Title at the top of the body; wake indicator in the top-right corner. */
     lcd_draw_text(DIAG_X, TITLE_Y, "Assistant", COL_TITLE, COL_BG);
 
     /* Force a full repaint of everything below the title. */
@@ -259,6 +344,9 @@ void ui_page_assistant_redraw(void)
         s_drawn_rejs = utterance_total_rejects;
     }
 
+    /* Response area (shows the last response across tab switches). */
+    draw_response();
+
     /* Network status line. */
     {
         char nbuf[NET_STR_CAP];
@@ -286,20 +374,8 @@ void ui_page_assistant_redraw(void)
     draw_indicator((s_flash_remaining > 0) ||
                    (utterance_state == UTTERANCE_STATE_ACTIVE));
 
-    /* Initial diag lines so the user sees something even before the first tick. */
-    char num[32];
-    emit_u32(wake_word_total_inferences, num);
-    draw_diag_line(DIAG_INFER_Y, "Inferences: ", num);
-    s_drawn_inferences = wake_word_total_inferences;
-
-    emit_u32(wake_word_total_fires, num);
-    draw_diag_line(DIAG_FIRES_Y, "Wake fires: ", num);
-    s_drawn_fires = wake_word_total_fires;
-
-    int32_t mille = (int32_t)(wake_word_last_confidence * 1000.0f);
-    emit_milli(mille, num);
-    draw_diag_line(DIAG_CONF_Y, "Confidence: ", num);
-    s_drawn_conf_mille = mille;
+    /* Initial diag line so the user sees something even before the first tick. */
+    draw_diag();
 }
 
 void ui_page_assistant_tick(void)
@@ -357,8 +433,13 @@ void ui_page_assistant_tick(void)
         s_drawn_rejs = rejs_now;
     }
 
-    /* Network status — delta-only. Once DHCP-bound the string is static, so this
-       repaints only on link/lease transitions, not every tick. */
+    /* Response area — repaint only when a new response lands. */
+    if (assistant_response_seq != s_drawn_resp_seq) {
+        draw_response();
+    }
+
+    /* Network status — delta-only. Once DHCP-bound the string is static until
+       a counter ticks, so this repaints on transitions, not every tick. */
     {
         char nbuf[NET_STR_CAP];
         uint16_t ncol = build_net_text(nbuf);
@@ -389,35 +470,18 @@ void ui_page_assistant_tick(void)
     }
 #endif
 
-    /* Diagnostic updates — delta-only so the LCD doesn't churn when nothing
-       interesting is happening. */
-    uint32_t inferences_now = wake_word_total_inferences;
-    if (inferences_now != s_drawn_inferences) {
-        char num[16];
-        emit_u32(inferences_now, num);
-        draw_diag_line(DIAG_INFER_Y, "Inferences: ", num);
-        s_drawn_inferences = inferences_now;
-    }
-
-    if (fires_now != s_drawn_fires) {
-        char num[16];
-        emit_u32(fires_now, num);
-        draw_diag_line(DIAG_FIRES_Y, "Wake fires: ", num);
-        s_drawn_fires = fires_now;
-    }
-
+    /* Compact diagnostics — delta-only on any of the three values. */
     int32_t mille = (int32_t)(wake_word_last_confidence * 1000.0f);
-    if (mille != s_drawn_conf_mille) {
-        char num[16];
-        emit_milli(mille, num);
-        draw_diag_line(DIAG_CONF_Y, "Confidence: ", num);
-        s_drawn_conf_mille = mille;
+    if (wake_word_total_inferences != s_drawn_inferences ||
+        fires_now != s_drawn_fires ||
+        mille != s_drawn_conf_mille) {
+        draw_diag();
     }
 }
 
 void ui_page_assistant_touch(uint16_t tx, uint16_t ty, bool edge)
 {
-    /* Stub has no interactive controls. Phase 7 will use this hook for the
-       utterance-capture transport. */
+    /* No interactive controls yet. Candidate Phase 8 polish: tap the response
+       area to clear it, or tap the net line to force a reconnect. */
     (void)tx; (void)ty; (void)edge;
 }

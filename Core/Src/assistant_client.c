@@ -1,0 +1,473 @@
+#include "assistant_client.h"
+#include "utterance.h"
+#include "net.h"
+#include "sha1.h"
+
+#include "FreeRTOS.h"
+#include "task.h"
+
+#include "lwip/api.h"
+#include "lwip/ip_addr.h"
+
+#include "stm32f7xx.h"   /* DWT->CYCCNT for mask/nonce entropy */
+
+#include <stdbool.h>
+#include <string.h>
+
+/*
+ * Hand-rolled RFC 6455 WebSocket client over LwIP's netconn API.
+ *
+ * Scope is deliberately v1-narrow: ws:// only (no TLS), one connection, one
+ * outstanding request. The full utterance is sent as a SINGLE binary frame
+ * (16-bit or 64-bit extended length) — the payload is masked straight out of
+ * the pinned SDRAM capture buffer in 2 KB chunks, so no second copy of the
+ * utterance ever exists. Client→server frames are masked per RFC 6455; the
+ * mask key comes from DWT->CYCCNT (cache-poisoning defense is moot on a
+ * trusted LAN — it just has to vary).
+ *
+ * The task never touches the audio path: it blocks inside LwIP with timeouts
+ * (LWIP_SO_RCVTIMEO / LWIP_SO_SNDTIMEO, enabled in lwipopts.h USER CODE) and
+ * its worst failure mode is a missed response, never a glitch.
+ */
+
+/* ---- public state -------------------------------------------------------- */
+
+volatile int32_t  assistant_init_status = 0;
+volatile uint8_t  assistant_status      = ASSIST_IDLE;
+char              assistant_response[ASSISTANT_RESPONSE_CAP];
+volatile uint32_t assistant_response_seq = 0;
+volatile uint32_t assistant_total_ok     = 0;
+volatile uint32_t assistant_total_errors = 0;
+volatile uint32_t assistant_last_rtt_ms  = 0;
+
+/* ---- timeouts / tunables -------------------------------------------------- */
+
+#define POLL_MS            50      /* utterance_state poll cadence */
+#define ERROR_HOLD_MS      3000    /* how long ASSIST_ERROR stays on screen */
+#define HS_RECV_TIMEOUT_MS 5000    /* handshake response */
+#define RESP_TIMEOUT_MS    20000   /* ASR + LLM round-trip budget */
+#define SEND_TIMEOUT_MS    10000   /* per-netconn_write stall limit */
+#define TX_CHUNK           2048    /* masking chunk (bounds our .bss buffer) */
+
+/* ---- connection state ----------------------------------------------------- */
+
+static struct netconn *s_conn   = NULL;
+static bool            s_ws_up  = false;
+
+/* RX cursor over netconn_recv's netbuf chain. */
+static struct netbuf  *s_nb      = NULL;
+static uint16_t        s_nb_off  = 0;    /* offset into current netbuf part */
+
+/* Static work buffers — keeps the 768-word task stack honest. */
+static uint8_t s_chunk[TX_CHUNK];        /* masked TX staging */
+static char    s_hs[512];                /* handshake request/response */
+
+static TickType_t s_error_until = 0;
+
+/* ---- small utilities ------------------------------------------------------ */
+
+static uint32_t entropy32(void)
+{
+    /* CYCCNT free-runs at 216 MHz (dsp_init did the LAR unlock); fold in the
+       tick count so back-to-back calls in one loop iteration still differ. */
+    return DWT->CYCCNT ^ (xTaskGetTickCount() * 2654435761u);
+}
+
+static void rx_reset(void)
+{
+    if (s_nb != NULL) {
+        netbuf_delete(s_nb);
+        s_nb = NULL;
+    }
+    s_nb_off = 0;
+}
+
+static void conn_close(void)
+{
+    rx_reset();
+    if (s_conn != NULL) {
+        netconn_close(s_conn);
+        netconn_delete(s_conn);
+        s_conn = NULL;
+    }
+    s_ws_up = false;
+}
+
+/* Pull exactly `n` bytes from the connection (across netbuf/part boundaries).
+   Returns false on timeout/close/error. */
+static bool rx_read(uint8_t *dst, uint32_t n)
+{
+    while (n > 0) {
+        if (s_nb == NULL) {
+            if (netconn_recv(s_conn, &s_nb) != ERR_OK) {
+                s_nb = NULL;
+                return false;
+            }
+            netbuf_first(s_nb);
+            s_nb_off = 0;
+        }
+        void    *data;
+        uint16_t len;
+        netbuf_data(s_nb, &data, &len);
+        if (s_nb_off >= len) {
+            if (netbuf_next(s_nb) < 0) {
+                netbuf_delete(s_nb);
+                s_nb = NULL;
+            } else {
+                s_nb_off = 0;
+            }
+            continue;
+        }
+        uint32_t take = (uint32_t)len - s_nb_off;
+        if (take > n) take = n;
+        memcpy(dst, (const uint8_t *)data + s_nb_off, take);
+        dst      += take;
+        n        -= take;
+        s_nb_off += (uint16_t)take;
+    }
+    return true;
+}
+
+/* Discard `n` bytes (oversized payloads we don't want). */
+static bool rx_skip(uint32_t n)
+{
+    uint8_t scratch[32];
+    while (n > 0) {
+        uint32_t take = (n > sizeof(scratch)) ? sizeof(scratch) : n;
+        if (!rx_read(scratch, take)) return false;
+        n -= take;
+    }
+    return true;
+}
+
+/* ---- WebSocket framing ----------------------------------------------------- */
+
+/* Send one complete masked frame with a small (<126 B) payload — control
+   frames (pong/close) and nothing else. */
+static err_t ws_send_small(uint8_t opcode, const uint8_t *payload, uint8_t n)
+{
+    uint8_t f[2 + 4 + 125];
+    uint32_t key = entropy32();
+    f[0] = (uint8_t)(0x80u | opcode);
+    f[1] = (uint8_t)(0x80u | n);
+    memcpy(&f[2], &key, 4);
+    for (uint8_t i = 0; i < n; i++) {
+        f[6 + i] = payload[i] ^ ((const uint8_t *)&key)[i & 3];
+    }
+    return netconn_write(s_conn, f, 6u + n, NETCONN_COPY);
+}
+
+/* Send one binary frame whose payload is `n` bytes at `src` (the pinned
+   utterance buffer). Header first, then the payload masked through s_chunk in
+   TX_CHUNK slices — netconn_write(NETCONN_COPY) has copied each slice into
+   LwIP's core before returning, so s_chunk is immediately reusable. */
+static err_t ws_send_binary(const uint8_t *src, uint32_t n)
+{
+    uint8_t  h[14];
+    uint32_t hn;
+    uint32_t key = entropy32();
+
+    h[0] = 0x82;                       /* FIN | binary */
+    if (n < 126u) {
+        h[1] = (uint8_t)(0x80u | n);
+        hn = 2;
+    } else if (n < 65536u) {
+        h[1] = 0x80u | 126u;
+        h[2] = (uint8_t)(n >> 8);
+        h[3] = (uint8_t)n;
+        hn = 4;
+    } else {
+        h[1] = 0x80u | 127u;
+        memset(&h[2], 0, 4);           /* top 32 bits of the 64-bit length */
+        h[6] = (uint8_t)(n >> 24);
+        h[7] = (uint8_t)(n >> 16);
+        h[8] = (uint8_t)(n >> 8);
+        h[9] = (uint8_t)n;
+        hn = 10;
+    }
+    memcpy(&h[hn], &key, 4);
+    hn += 4;
+
+    err_t err = netconn_write(s_conn, h, hn, NETCONN_COPY);
+    if (err != ERR_OK) return err;
+
+    uint32_t off = 0;
+    while (off < n) {
+        uint32_t take = n - off;
+        if (take > TX_CHUNK) take = TX_CHUNK;
+        for (uint32_t i = 0; i < take; i++) {
+            s_chunk[i] = src[off + i] ^ ((const uint8_t *)&key)[(off + i) & 3];
+        }
+        err = netconn_write(s_conn, s_chunk, take, NETCONN_COPY);
+        if (err != ERR_OK) return err;
+        off += take;
+    }
+    return ERR_OK;
+}
+
+/* Receive one complete data message into out[cap] (NUL-terminated, non-ASCII
+   sanitized to '?'). Handles ping/pong/close control frames inline. Returns
+   the text length, or -1 on error/timeout/close. */
+static int ws_recv_msg(char *out, uint32_t cap)
+{
+    uint32_t used = 0;
+    bool     done = false;
+
+    while (!done) {
+        uint8_t hdr[2];
+        if (!rx_read(hdr, 2)) return -1;
+
+        uint8_t  fin    = hdr[0] & 0x80u;
+        uint8_t  opcode = hdr[0] & 0x0Fu;
+        uint8_t  masked = hdr[1] & 0x80u;
+        uint64_t plen   = hdr[1] & 0x7Fu;
+
+        if (masked) return -1;         /* server frames must be unmasked */
+
+        if (plen == 126u) {
+            uint8_t e[2];
+            if (!rx_read(e, 2)) return -1;
+            plen = ((uint64_t)e[0] << 8) | e[1];
+        } else if (plen == 127u) {
+            uint8_t e[8];
+            if (!rx_read(e, 8)) return -1;
+            plen = 0;
+            for (int i = 0; i < 8; i++) plen = (plen << 8) | e[i];
+        }
+
+        if (opcode == 0x9u) {          /* ping → pong (echo payload) */
+            uint8_t pp[125];
+            if (plen > 125u) return -1;
+            if (!rx_read(pp, (uint32_t)plen)) return -1;
+            if (ws_send_small(0xA, pp, (uint8_t)plen) != ERR_OK) return -1;
+            continue;
+        }
+        if (opcode == 0xAu) {          /* pong — ignore */
+            if (!rx_skip((uint32_t)plen)) return -1;
+            continue;
+        }
+        if (opcode == 0x8u) {          /* close — acknowledge and bail */
+            ws_send_small(0x8, NULL, 0);
+            s_ws_up = false;
+            return -1;
+        }
+        /* 0x1 text / 0x2 binary / 0x0 continuation: accumulate. */
+        uint32_t want = (uint32_t)plen;
+        uint32_t room = (cap - 1u) - used;
+        uint32_t take = (want > room) ? room : want;
+        if (take > 0 && !rx_read((uint8_t *)out + used, take)) return -1;
+        used += take;
+        if (want > take && !rx_skip(want - take)) return -1;
+        if (fin) done = true;
+    }
+
+    out[used] = 0;
+    /* The LCD font is ASCII 8x16 — replace anything unprintable. Newlines
+       become spaces; the UI re-wraps by word anyway. */
+    for (uint32_t i = 0; i < used; i++) {
+        char c = out[i];
+        if (c == '\n' || c == '\r' || c == '\t') out[i] = ' ';
+        else if (c < 0x20 || c > 0x7E)           out[i] = '?';
+    }
+    return (int)used;
+}
+
+/* ---- connect + handshake --------------------------------------------------- */
+
+static bool ws_connect(void)
+{
+    ip_addr_t ip;
+    if (!ipaddr_aton(ASSISTANT_HELPER_IP, &ip)) {
+        return false;
+    }
+
+    s_conn = netconn_new(NETCONN_TCP);
+    if (s_conn == NULL) return false;
+
+    netconn_set_recvtimeout(s_conn, HS_RECV_TIMEOUT_MS);
+    netconn_set_sendtimeout(s_conn, SEND_TIMEOUT_MS);
+
+    if (netconn_connect(s_conn, &ip, ASSISTANT_HELPER_PORT) != ERR_OK) {
+        conn_close();
+        return false;
+    }
+
+    /* Sec-WebSocket-Key: Base64 of 16 nonce bytes. */
+    uint32_t nonce[4] = { entropy32(), entropy32() ^ 0xA5A5A5A5u,
+                          entropy32() + 0x9E3779B9u, entropy32() ^ 0x5F356495u };
+    char key24[32];
+    base64_encode((const uint8_t *)nonce, 16, key24, sizeof(key24));
+
+    /* Expected Sec-WebSocket-Accept = Base64(SHA1(key || RFC 6455 GUID)). */
+    char accept_src[64];
+    int  an = 0;
+    an  = (int)strlen(key24);
+    memcpy(accept_src, key24, (size_t)an);
+    memcpy(accept_src + an, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11", 36);
+    uint8_t digest[20];
+    sha1(accept_src, (size_t)an + 36, digest);
+    char accept28[32];
+    base64_encode(digest, 20, accept28, sizeof(accept28));
+
+    int n = 0;
+    n  = (int)strlen(strcpy(s_hs, "GET " ASSISTANT_WS_PATH " HTTP/1.1\r\n"
+                                  "Host: " ASSISTANT_HELPER_IP "\r\n"
+                                  "Upgrade: websocket\r\n"
+                                  "Connection: Upgrade\r\n"
+                                  "Sec-WebSocket-Version: 13\r\n"
+                                  "Sec-WebSocket-Key: "));
+    memcpy(s_hs + n, key24, strlen(key24));
+    n += (int)strlen(key24);
+    memcpy(s_hs + n, "\r\n\r\n", 4);
+    n += 4;
+
+    if (netconn_write(s_conn, s_hs, (size_t)n, NETCONN_COPY) != ERR_OK) {
+        conn_close();
+        return false;
+    }
+
+    /* Read the response headers (byte-wise scan for the blank line — the
+       whole thing is a few hundred bytes, once per connection). */
+    uint32_t hn = 0;
+    while (hn < sizeof(s_hs) - 1) {
+        if (!rx_read((uint8_t *)&s_hs[hn], 1)) {
+            conn_close();
+            return false;
+        }
+        hn++;
+        if (hn >= 4 && memcmp(&s_hs[hn - 4], "\r\n\r\n", 4) == 0) break;
+    }
+    s_hs[hn] = 0;
+
+    if (strncmp(s_hs, "HTTP/1.1 101", 12) != 0 ||
+        strstr(s_hs, accept28) == NULL) {
+        conn_close();
+        return false;
+    }
+
+    s_ws_up = true;
+    return true;
+}
+
+/* ---- round-trip ------------------------------------------------------------- */
+
+/* Upload the pinned capture and wait for the reply. Returns true on success
+   (assistant_response updated + seq bumped). */
+static bool do_round_trip(const int16_t *pcm, uint32_t samples)
+{
+    bool was_up = s_ws_up;
+
+    assistant_status = ASSIST_CONNECTING;
+    if (!s_ws_up && !ws_connect()) {
+        return false;
+    }
+
+    assistant_status = ASSIST_UPLOADING;
+    TickType_t t0 = xTaskGetTickCount();
+
+    err_t err = ws_send_binary((const uint8_t *)pcm, samples * 2u);
+    if (err != ERR_OK && was_up) {
+        /* Persistent connection had gone stale (helper restarted, idle drop).
+           One reconnect + resend attempt, then give up. */
+        conn_close();
+        assistant_status = ASSIST_CONNECTING;
+        if (!ws_connect()) return false;
+        assistant_status = ASSIST_UPLOADING;
+        err = ws_send_binary((const uint8_t *)pcm, samples * 2u);
+    }
+    if (err != ERR_OK) {
+        conn_close();
+        return false;
+    }
+
+    assistant_status = ASSIST_WAITING;
+    netconn_set_recvtimeout(s_conn, RESP_TIMEOUT_MS);
+
+    int rn = ws_recv_msg(assistant_response, ASSISTANT_RESPONSE_CAP);
+    if (rn < 0) {
+        /* Timeout or protocol error — connection state is unknowable, drop it
+           so the next utterance starts clean. */
+        conn_close();
+        return false;
+    }
+
+    assistant_last_rtt_ms =
+        (uint32_t)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS);
+    assistant_response_seq++;
+    return true;
+}
+
+/* ---- task ------------------------------------------------------------------- */
+
+static void assistant_task(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+
+        /* Let a displayed error decay back to idle. */
+        if (assistant_status == ASSIST_ERROR) {
+            if ((int32_t)(xTaskGetTickCount() - s_error_until) >= 0) {
+                assistant_status = ASSIST_IDLE;
+            }
+            continue;
+        }
+        if (assistant_status == ASSIST_NO_NET &&
+            utterance_state != UTTERANCE_STATE_ENDED) {
+            assistant_status = ASSIST_IDLE;   /* the capture expired unclaimed */
+        }
+
+        if (utterance_state != UTTERANCE_STATE_ENDED) {
+            continue;
+        }
+
+        if (!net_dhcp_bound()) {
+            /* Don't take the capture — utterance auto-re-arms after its hold
+               window, and the UI shows why nothing was sent. */
+            assistant_status = ASSIST_NO_NET;
+            continue;
+        }
+
+        int16_t  *pcm = NULL;
+        uint32_t  samples = 0;
+        if (!utterance_take(&pcm, &samples) || pcm == NULL || samples == 0) {
+            continue;
+        }
+
+        bool ok = do_round_trip(pcm, samples);
+
+        /* The payload has been fully copied into LwIP (NETCONN_COPY) or the
+           attempt failed — either way the capture buffer is done. Release so
+           the utterance task can re-arm while we (on success) already idle. */
+        utterance_release();
+
+        if (ok) {
+            assistant_total_ok++;
+            assistant_status = ASSIST_IDLE;
+        } else {
+            assistant_total_errors++;
+            assistant_status = ASSIST_ERROR;
+            s_error_until = xTaskGetTickCount() + pdMS_TO_TICKS(ERROR_HOLD_MS);
+        }
+    }
+}
+
+void assistant_client_init(void)
+{
+    ip_addr_t ip;
+    if (!ipaddr_aton(ASSISTANT_HELPER_IP, &ip)) {
+        assistant_init_status = -1;
+        return;
+    }
+
+    assistant_response[0] = 0;
+
+    /* 768 words = 3 KB. Deepest path is ws_connect (SHA-1 W[80] + locals,
+       ~0.5 KB) on top of netconn API calls; the big buffers are all static. */
+    BaseType_t ok = xTaskCreate(assistant_task, "Assist", 768, NULL,
+                                tskIDLE_PRIORITY + 2, NULL);
+    if (ok != pdPASS) {
+        assistant_init_status = -2;
+    }
+}
