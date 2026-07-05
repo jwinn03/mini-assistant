@@ -2,6 +2,7 @@
 #include "lcd.h"
 #include "wake_word.h"
 #include "utterance.h"
+#include "net.h"
 #include <stdbool.h>
 #include <string.h>
 
@@ -42,7 +43,13 @@
 /* VAD tuning aid: live frame energy vs. adaptive noise floor. Slots just below
    the indicator dot (130..154). */
 #define VAD_Y              158
+/* VAD aid owns the 158 slot; push the network line to the bottom row. */
+#define NET_Y              256
+#else
+/* Phase 8: network status line in the slot the (disabled) VAD readout freed. */
+#define NET_Y              158
 #endif
+#define NET_STR_CAP        40
 
 #define COL_BG             0x0000          /* LCD_BLACK */
 #define COL_FG             0xFFFF          /* LCD_WHITE */
@@ -54,6 +61,11 @@
 #define COL_STATE_CAPTURE  0x07E0          /* green  — ACTIVE / capturing */
 #define COL_STATE_DONE     0x07FF          /* cyan   — ENDED / captured */
 #define COL_STATE_REJECT   0xFD20          /* orange — too-short reject flash */
+
+/* Phase 8 network status colours. */
+#define COL_NET_OK         0x07E0          /* green  — DHCP bound, IP shown */
+#define COL_NET_PENDING    0xFFE0          /* yellow — link up, awaiting DHCP */
+#define COL_NET_DOWN       0x8410          /* gray   — no link / no cable */
 
 /* Local state — what we've already rendered, so each 33 ms tick is delta-only.
    s_drawn_* hold last-painted values; INT32_MAX sentinel forces first draw. */
@@ -76,6 +88,10 @@ static uint32_t s_drawn_caps        = 0xFFFFFFFFu;
 static uint32_t s_drawn_rejs        = 0xFFFFFFFFu;
 static uint8_t  s_reject_flash      = 0;     /* "Rejected" overlay countdown */
 static uint32_t s_last_seen_rejects = 0;
+
+/* Phase 8 network status render cache (delta-only repaint). */
+static char     s_drawn_net_str[NET_STR_CAP] = { '\x01', '\0' };  /* junk forces first draw */
+static uint16_t s_drawn_net_col     = 0xFFFE;
 
 #if ASSIST_VAD_READOUT
 /* VAD tuning-aid render cache. */
@@ -157,6 +173,25 @@ static uint16_t build_state_text(char *out)
     }
 }
 
+/* Compose the network status line into `out`; returns the colour to draw it in.
+   "Net: 192.168.1.42" once DHCP-bound, "Net: DHCP..." while waiting on a lease,
+   "Net: link down" with no cable. Reads LwIP netif status via net.c, which is
+   safe to call from the UI task (plain field reads, not socket/netconn API). */
+static uint16_t build_net_text(char *out)
+{
+    int n = put_str(out, 0, "Net: ");
+    if (net_dhcp_bound()) {
+        net_ip_str(out + n, NET_STR_CAP - n);
+        return COL_NET_OK;
+    }
+    if (net_link_up()) {
+        put_str(out, n, "DHCP...");
+        return COL_NET_PENDING;
+    }
+    put_str(out, n, "link down");
+    return COL_NET_DOWN;
+}
+
 /* ----- drawing primitives ------------------------------------------------ */
 
 /* Wipe one text row and draw `txt` in `col`. */
@@ -222,6 +257,16 @@ void ui_page_assistant_redraw(void)
         draw_row(CAPMETA_Y, m, COL_FG);
         s_drawn_caps = utterance_total_captures;
         s_drawn_rejs = utterance_total_rejects;
+    }
+
+    /* Network status line. */
+    {
+        char nbuf[NET_STR_CAP];
+        uint16_t ncol = build_net_text(nbuf);
+        draw_row(NET_Y, nbuf, ncol);
+        strncpy(s_drawn_net_str, nbuf, sizeof(s_drawn_net_str) - 1);
+        s_drawn_net_str[sizeof(s_drawn_net_str) - 1] = 0;
+        s_drawn_net_col = ncol;
     }
 
 #if ASSIST_VAD_READOUT
@@ -310,6 +355,19 @@ void ui_page_assistant_tick(void)
         draw_row(CAPMETA_Y, m, COL_FG);
         s_drawn_caps = utterance_total_captures;
         s_drawn_rejs = rejs_now;
+    }
+
+    /* Network status — delta-only. Once DHCP-bound the string is static, so this
+       repaints only on link/lease transitions, not every tick. */
+    {
+        char nbuf[NET_STR_CAP];
+        uint16_t ncol = build_net_text(nbuf);
+        if (ncol != s_drawn_net_col || strcmp(nbuf, s_drawn_net_str) != 0) {
+            draw_row(NET_Y, nbuf, ncol);
+            strncpy(s_drawn_net_str, nbuf, sizeof(s_drawn_net_str) - 1);
+            s_drawn_net_str[sizeof(s_drawn_net_str) - 1] = 0;
+            s_drawn_net_col = ncol;
+        }
     }
 
 #if ASSIST_VAD_READOUT
