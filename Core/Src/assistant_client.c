@@ -48,7 +48,6 @@ volatile int32_t  assistant_dbg_err      = 0;
 #define ERROR_HOLD_MS      3000    /* how long ASSIST_ERROR stays on screen */
 #define HS_RECV_TIMEOUT_MS 5000    /* handshake response */
 #define RESP_TIMEOUT_MS    20000   /* ASR + LLM round-trip budget */
-#define SEND_TIMEOUT_MS    10000   /* per-netconn_write stall limit */
 #define TX_CHUNK           2048    /* masking chunk (bounds our .bss buffer) */
 
 /* ---- connection state ----------------------------------------------------- */
@@ -291,7 +290,11 @@ static bool ws_connect(void)
     if (s_conn == NULL) { assistant_dbg_err = -100; return false; }
 
     netconn_set_recvtimeout(s_conn, HS_RECV_TIMEOUT_MS);
-    netconn_set_sendtimeout(s_conn, SEND_TIMEOUT_MS);
+    /* Deliberately NO send timeout. LwIP treats a non-zero send_timeout as a
+       non-blocking send, and netconn_write() (bytes_written == NULL) then
+       returns ERR_VAL because it can't report a partial write. Plain blocking
+       writes are correct here; a stalled send is still bounded by TCP-level
+       retransmit timeouts, and the recv timeout bounds the reply wait. */
 
     assistant_dbg_step = 3;
     err = netconn_connect(s_conn, &ip, ASSISTANT_HELPER_PORT);

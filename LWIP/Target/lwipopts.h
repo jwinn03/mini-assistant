@@ -128,12 +128,14 @@
 #undef  MEM_SIZE
 #define MEM_SIZE (12 * 1024)
 
-/* Phase 8 assistant client: netconn_set_recvtimeout / netconn_set_sendtimeout
-   need these options compiled in. Without a recv timeout, a helper that dies
-   mid-request would block the assistant task forever; with it, the wait is
-   bounded and the task recovers with an error status. */
+/* Phase 8 assistant client: netconn_set_recvtimeout needs this option so a
+   helper that dies mid-request can't block the assistant task forever — the
+   wait is bounded and the task recovers with an error status.
+   NB: LWIP_SO_SNDTIMEO is intentionally NOT enabled. A non-zero send timeout
+   makes LwIP treat netconn_write() as non-blocking and return ERR_VAL (it has
+   no way to report a partial write). Blocking writes + TCP's own retransmit
+   timeouts are the right model for our bulk PCM upload. */
 #define LWIP_SO_RCVTIMEO 1
-#define LWIP_SO_SNDTIMEO 1
 
 /* USER CODE END 1 */
 
