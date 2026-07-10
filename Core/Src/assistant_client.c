@@ -39,6 +39,8 @@ volatile uint32_t assistant_response_seq = 0;
 volatile uint32_t assistant_total_ok     = 0;
 volatile uint32_t assistant_total_errors = 0;
 volatile uint32_t assistant_last_rtt_ms  = 0;
+volatile int32_t  assistant_dbg_step     = 0;
+volatile int32_t  assistant_dbg_err      = 0;
 
 /* ---- timeouts / tunables -------------------------------------------------- */
 
@@ -276,18 +278,25 @@ static int ws_recv_msg(char *out, uint32_t cap)
 
 static bool ws_connect(void)
 {
+    err_t err;
     ip_addr_t ip;
+    assistant_dbg_step = 1;
     if (!ipaddr_aton(ASSISTANT_HELPER_IP, &ip)) {
+        assistant_dbg_err = -100;
         return false;
     }
 
+    assistant_dbg_step = 2;
     s_conn = netconn_new(NETCONN_TCP);
-    if (s_conn == NULL) return false;
+    if (s_conn == NULL) { assistant_dbg_err = -100; return false; }
 
     netconn_set_recvtimeout(s_conn, HS_RECV_TIMEOUT_MS);
     netconn_set_sendtimeout(s_conn, SEND_TIMEOUT_MS);
 
-    if (netconn_connect(s_conn, &ip, ASSISTANT_HELPER_PORT) != ERR_OK) {
+    assistant_dbg_step = 3;
+    err = netconn_connect(s_conn, &ip, ASSISTANT_HELPER_PORT);
+    if (err != ERR_OK) {
+        assistant_dbg_err = err;
         conn_close();
         return false;
     }
@@ -321,16 +330,21 @@ static bool ws_connect(void)
     memcpy(s_hs + n, "\r\n\r\n", 4);
     n += 4;
 
-    if (netconn_write(s_conn, s_hs, (size_t)n, NETCONN_COPY) != ERR_OK) {
+    assistant_dbg_step = 4;
+    err = netconn_write(s_conn, s_hs, (size_t)n, NETCONN_COPY);
+    if (err != ERR_OK) {
+        assistant_dbg_err = err;
         conn_close();
         return false;
     }
 
     /* Read the response headers (byte-wise scan for the blank line — the
        whole thing is a few hundred bytes, once per connection). */
+    assistant_dbg_step = 5;
     uint32_t hn = 0;
     while (hn < sizeof(s_hs) - 1) {
         if (!rx_read((uint8_t *)&s_hs[hn], 1)) {
+            assistant_dbg_err = -100;
             conn_close();
             return false;
         }
@@ -339,8 +353,10 @@ static bool ws_connect(void)
     }
     s_hs[hn] = 0;
 
+    assistant_dbg_step = 6;
     if (strncmp(s_hs, "HTTP/1.1 101", 12) != 0 ||
         strstr(s_hs, accept28) == NULL) {
+        assistant_dbg_err = -100;
         conn_close();
         return false;
     }
@@ -363,6 +379,7 @@ static bool do_round_trip(const int16_t *pcm, uint32_t samples)
     }
 
     assistant_status = ASSIST_UPLOADING;
+    assistant_dbg_step = 7;
     TickType_t t0 = xTaskGetTickCount();
 
     err_t err = ws_send_binary((const uint8_t *)pcm, samples * 2u);
@@ -376,11 +393,13 @@ static bool do_round_trip(const int16_t *pcm, uint32_t samples)
         err = ws_send_binary((const uint8_t *)pcm, samples * 2u);
     }
     if (err != ERR_OK) {
+        assistant_dbg_err = err;
         conn_close();
         return false;
     }
 
     assistant_status = ASSIST_WAITING;
+    assistant_dbg_step = 8;
     netconn_set_recvtimeout(s_conn, RESP_TIMEOUT_MS);
 
     int rn = ws_recv_msg(assistant_response, ASSISTANT_RESPONSE_CAP);

@@ -192,9 +192,17 @@ static uint16_t build_state_text(char *out)
     case ASSIST_WAITING:
         put_str(out, 0, "Waiting for helper...");
         return COL_ASSIST_WAIT;
-    case ASSIST_ERROR:
-        put_str(out, 0, "Helper error");
+    case ASSIST_ERROR: {
+        /* Show the failing stage + LwIP err so a bad round-trip is diagnosable
+           without a debugger. e.g. "Helper err s4 e-1" = netconn_write ERR_MEM. */
+        int n = put_str(out, 0, "Helper err s");
+        n += emit_u32((uint32_t)assistant_dbg_step, out + n);
+        n  = put_str(out, n, " e");
+        int32_t e = assistant_dbg_err;
+        if (e < 0) { out[n++] = '-'; out[n] = 0; e = -e; }
+        emit_u32((uint32_t)e, out + n);
         return COL_ASSIST_ERR;
+    }
     default:
         break;
     }

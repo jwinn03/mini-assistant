@@ -23,7 +23,7 @@
 
 /* EDIT ME: IPv4 address of the machine running helper/server.py. mDNS
    resolution of mini-helper.local is future work; v1 uses a static literal. */
-#define ASSISTANT_HELPER_IP    "192.168.1.100"
+#define ASSISTANT_HELPER_IP    "192.168.137.59"
 #define ASSISTANT_HELPER_PORT  8765
 #define ASSISTANT_WS_PATH      "/utterance"
 
@@ -62,5 +62,13 @@ extern volatile uint32_t assistant_response_seq;
 extern volatile uint32_t assistant_total_ok;       /* responses received */
 extern volatile uint32_t assistant_total_errors;   /* failed round-trips */
 extern volatile uint32_t assistant_last_rtt_ms;    /* upload→response time */
+
+/* Debug (read in the debugger after a "Helper error"). assistant_dbg_step is
+   the last stage reached: 1=aton 2=netconn_new 3=connect 4=write-handshake
+   5=read-response 6=validate-101 7=send-binary 8=recv-response. assistant_dbg_err
+   is the LwIP err_t from the failing call (0=ERR_OK .. -16=ERR_ARG; -100 marks a
+   non-err_t failure such as a short read or a bad 101 line). */
+extern volatile int32_t  assistant_dbg_step;
+extern volatile int32_t  assistant_dbg_err;
 
 #endif /* ASSISTANT_CLIENT_H */
