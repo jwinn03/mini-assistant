@@ -85,6 +85,20 @@ The server logs per-stage timings; use them to decide what to attack first.
 
 - **Board shows "Helper error"**: server not running / wrong
   `ASSISTANT_HELPER_IP` / firewall blocking port 8765 (allow inbound TCP 8765).
+  The board's error line encodes the failing stage — `s3` connect, `s4-6`
+  handshake, `s7` upload, `s8` reply wait — plus the LwIP `err_t`.
+- **Board stuck a long time at "Connecting..." with no server logs** (Windows):
+  the SYN is being silently dropped. Two stacked gotchas: (1) allow rules are
+  often scoped to *Private* networks while a direct board link is classified
+  *Public/Unidentified*; (2) a previously dismissed firewall prompt creates
+  `Python` inbound **Block** rules on Public — and Block rules beat Allow rules.
+  Check with `netsh advfirewall firewall show rule name="Python"`, delete any
+  inbound Block entries, and add the port rule with `profile=any`:
+  `netsh advfirewall firewall add rule name="mini-helper 8765" dir=in
+  action=allow protocol=TCP localport=8765 profile=any` (admin shell).
+  Note: a loopback test on the server machine bypasses the firewall entirely,
+  so it proves the server works but not that the board can reach it; check the
+  board's MAC (`00-80-e1-...`) in `arp -a` to confirm L2 reachability instead.
 - **Board shows "No network"**: board has no DHCP lease — check cable and the
   `Net:` line on the Assist tab.
 - **Replies cut off with `...`**: reply exceeded the LCD area; shorten via the

@@ -25,9 +25,10 @@
  * mask key comes from DWT->CYCCNT (cache-poisoning defense is moot on a
  * trusted LAN — it just has to vary).
  *
- * The task never touches the audio path: it blocks inside LwIP with timeouts
- * (LWIP_SO_RCVTIMEO / LWIP_SO_SNDTIMEO, enabled in lwipopts.h USER CODE) and
- * its worst failure mode is a missed response, never a glitch.
+ * The task never touches the audio path: receives are bounded by recv
+ * timeouts (LWIP_SO_RCVTIMEO, enabled in lwipopts.h USER CODE; sends are
+ * plain blocking — see the note at netconn_new) and its worst failure mode
+ * is a missed response, never a glitch.
  */
 
 /* ---- public state -------------------------------------------------------- */
