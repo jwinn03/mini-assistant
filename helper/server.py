@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reference helper server for the mini-assistant (Phase 8).
+"""Reference helper server for the mini-assistant (Phase 8 transport, Phase 9 brains).
 
 Protocol (v1, matches Core/Src/assistant_client.c):
   - WebSocket on ws://0.0.0.0:8765 (any path; the firmware uses /utterance)
@@ -7,15 +7,18 @@ Protocol (v1, matches Core/Src/assistant_client.c):
                       (raw PCM, int16 little-endian, 16 kHz, mono)
   - server -> client: ONE text message = the assistant's reply (ASCII, short)
 
-Pipeline: faster-whisper ASR -> optional OpenAI-compatible chat endpoint.
+Pipeline: faster-whisper ASR (CUDA with CPU fallback) -> local LLM via any
+OpenAI-compatible /v1/chat/completions endpoint (default: Ollama on localhost).
+
 Modes:
   --echo            no ASR/LLM; replies with a canned string (transport test)
-  (default)         ASR only; replies "You said: <transcript>" unless an LLM
-                    endpoint is configured via environment variables
-LLM environment variables (OpenAI-compatible /v1/chat/completions):
-  OPENAI_BASE_URL   e.g. http://localhost:11434/v1  (Ollama) or an API base
-  OPENAI_API_KEY    key if the endpoint needs one (optional for local)
-  OPENAI_MODEL      model name (default: llama3.2)
+  --no-llm          ASR only; replies "You said: <transcript>"
+  (default)         ASR -> LLM with short conversation memory
+
+LLM configuration (CLI flags override the environment variables):
+  --llm-url    / OPENAI_BASE_URL   default http://localhost:11434/v1  (Ollama)
+  --llm-model  / OPENAI_MODEL      default llama3.2:3b
+  --llm-key    / OPENAI_API_KEY    optional (local endpoints don't need one)
 
 SECURITY: v1 is plain ws:// with no authentication — run it ONLY on a trusted
 LAN. Do not expose this port to the internet (see README.md).
@@ -25,7 +28,9 @@ import argparse
 import asyncio
 import logging
 import os
+import sys
 import time
+from collections import deque
 
 import websockets
 
@@ -40,29 +45,116 @@ SYSTEM_PROMPT = (
     "no markdown."
 )
 
+# Conversation memory: last N user/assistant exchanges, dropped after an idle
+# gap so a stale context can't bleed into an unrelated question hours later.
+MEMORY_MAX_EXCHANGES = 6
+MEMORY_IDLE_RESET_S = 300.0
+
+DEFAULT_LLM_URL = "http://localhost:11434/v1"   # Ollama's OpenAI-compatible API
+DEFAULT_LLM_MODEL = "llama3.2:3b"
+
+# Keep the LLM resident. Ollama unloads an idle model after ~5 min, and the
+# reload measured 44 s on this machine — far beyond the board's 20 s response
+# timeout, so the first query after a break would fail with "Helper err s8".
+# A tiny generation every WARM_INTERVAL_S (< the unload window) prevents it.
+WARM_INTERVAL_S = 240.0
+
+
+def add_cuda_dll_dirs():
+    """Windows: ctranslate2's CUDA build loads cublas64_12 / cudnn64_9 at
+    runtime. The pip packages nvidia-cublas-cu12 / nvidia-cudnn-cu12 ship them
+    under site-packages/nvidia/<lib>/bin but do NOT put them on PATH. (The
+    system CUDA 13 toolkit doesn't help: ctranslate2 4.8 links the
+    CUDA-12-series DLL names.)
+
+    Both registrations below are load-bearing: os.add_dll_directory() covers
+    import-time dependency resolution, but ctranslate2 resolves cuBLAS lazily
+    via a plain LoadLibrary(), which searches PATH — verified on this machine
+    that add_dll_directory alone still fails with "cublas64_12.dll is not
+    found or cannot be loaded". cuda_nvrtc rides along as a cuBLAS dependency."""
+    if sys.platform != "win32":
+        return
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.find_spec("nvidia")
+    if spec is None or not spec.submodule_search_locations:
+        return
+    for base in spec.submodule_search_locations:
+        for sub in ("cublas", "cudnn", "cuda_nvrtc"):
+            d = pathlib.Path(base) / sub / "bin"
+            if d.is_dir():
+                os.add_dll_directory(str(d))
+                os.environ["PATH"] = str(d) + os.pathsep + os.environ.get("PATH", "")
+                log.debug("registered CUDA DLL dir: %s", d)
+
 
 class Pipeline:
-    """Owns the (lazily constructed) ASR model and the optional LLM client."""
+    """Owns the ASR model, the LLM client config, and the conversation memory."""
 
     def __init__(self, args):
         self.echo = args.echo
         self.model = None
+        self.asr_device = None
         if not self.echo:
-            from faster_whisper import WhisperModel  # import here so --echo needs no deps
+            self._init_asr(args)
 
-            log.info("loading faster-whisper model %r ...", args.whisper_model)
-            self.model = WhisperModel(
-                args.whisper_model, device=args.device, compute_type="int8"
-            )
-            log.info("ASR ready")
+        self.chat_url = (args.llm_url or
+                         os.environ.get("OPENAI_BASE_URL", DEFAULT_LLM_URL)).rstrip("/")
+        self.chat_key = args.llm_key or os.environ.get("OPENAI_API_KEY", "")
+        self.chat_model = args.llm_model or os.environ.get("OPENAI_MODEL", DEFAULT_LLM_MODEL)
+        self.max_tokens = args.max_tokens
+        if args.no_llm:
+            self.chat_url = ""
 
-        self.chat_url = os.environ.get("OPENAI_BASE_URL", "").rstrip("/")
-        self.chat_key = os.environ.get("OPENAI_API_KEY", "")
-        self.chat_model = os.environ.get("OPENAI_MODEL", "llama3.2")
-        if self.chat_url:
-            log.info("LLM endpoint: %s (model %s)", self.chat_url, self.chat_model)
-        elif not self.echo:
-            log.info("no OPENAI_BASE_URL set - will reply with the transcript only")
+        self.memory_enabled = not args.no_memory
+        # Alternating user/assistant messages; even maxlen keeps pairs aligned.
+        self.history = deque(maxlen=2 * MEMORY_MAX_EXCHANGES)
+        self.last_used = 0.0
+
+        if self.echo:
+            log.info("echo mode - no ASR/LLM")
+        elif self.chat_url:
+            log.info("LLM endpoint: %s (model %s, max_tokens %d, memory %s)",
+                     self.chat_url, self.chat_model, self.max_tokens,
+                     "on" if self.memory_enabled else "off")
+        else:
+            log.info("no LLM (--no-llm) - replying with the transcript only")
+
+    def _init_asr(self, args):
+        """Load faster-whisper. --device auto tries CUDA (float16) and falls
+        back to CPU (int8); an explicit --device cuda/cpu is honoured strictly.
+        A short warm-up transcribe validates that CUDA kernels actually run —
+        model construction alone can succeed and still die at first use."""
+        add_cuda_dll_dirs()
+        import numpy as np
+        from faster_whisper import WhisperModel
+
+        if args.device == "auto":
+            attempts = [("cuda", "float16"), ("cpu", "int8")]
+        else:
+            attempts = [(args.device,
+                         "float16" if args.device == "cuda" else "int8")]
+
+        last_exc = None
+        for device, ctype in attempts:
+            try:
+                log.info("loading faster-whisper %r on %s (%s) ...",
+                         args.whisper_model, device, ctype)
+                model = WhisperModel(args.whisper_model, device=device,
+                                     compute_type=ctype)
+                segments, _ = model.transcribe(
+                    np.zeros(SAMPLE_RATE // 2, dtype="float32"),
+                    language="en", beam_size=1)
+                list(segments)  # force execution = real kernel validation
+                self.model = model
+                self.asr_device = device
+                log.info("ASR ready (%s, %s)", device, args.whisper_model)
+                return
+            except Exception as exc:
+                last_exc = exc
+                log.warning("ASR init on %s failed: %s", device, exc)
+        raise RuntimeError(f"could not initialise ASR: {last_exc}")
 
     def transcribe(self, pcm: bytes) -> str:
         import numpy as np
@@ -74,6 +166,16 @@ class Pipeline:
     def chat(self, prompt: str) -> str:
         import requests
 
+        now = time.time()
+        if (self.memory_enabled and self.history and
+                (now - self.last_used) > MEMORY_IDLE_RESET_S):
+            log.info("conversation memory reset (idle %.0f s)", now - self.last_used)
+            self.history.clear()
+
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend(self.history)
+        messages.append({"role": "user", "content": prompt})
+
         headers = {"Content-Type": "application/json"}
         if self.chat_key:
             headers["Authorization"] = f"Bearer {self.chat_key}"
@@ -82,16 +184,38 @@ class Pipeline:
             headers=headers,
             json={
                 "model": self.chat_model,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                "max_tokens": 120,
+                "messages": messages,
+                "max_tokens": self.max_tokens,
             },
             timeout=15,
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        reply = resp.json()["choices"][0]["message"]["content"].strip()
+
+        if self.memory_enabled:
+            self.history.append({"role": "user", "content": prompt})
+            self.history.append({"role": "assistant", "content": reply})
+        self.last_used = now
+        return reply
+
+    def warm(self) -> None:
+        """Tiny generation that forces the model into VRAM (and keeps it there).
+        Deliberately bypasses chat() so it never touches conversation memory."""
+        import requests
+
+        headers = {"Content-Type": "application/json"}
+        if self.chat_key:
+            headers["Authorization"] = f"Bearer {self.chat_key}"
+        requests.post(
+            f"{self.chat_url}/chat/completions",
+            headers=headers,
+            json={
+                "model": self.chat_model,
+                "messages": [{"role": "user", "content": "ok"}],
+                "max_tokens": 1,
+            },
+            timeout=120,  # generous: covers the initial cold load
+        ).raise_for_status()
 
     def handle(self, pcm: bytes) -> str:
         """Blocking worker (runs in an executor thread): audio bytes -> reply."""
@@ -131,9 +255,23 @@ async def main() -> None:
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--echo", action="store_true",
                     help="transport test mode: no ASR/LLM, canned reply")
-    ap.add_argument("--whisper-model", default="tiny.en",
+    ap.add_argument("--whisper-model", default="base.en",
                     help="faster-whisper model (tiny.en/base.en/small.en...)")
-    ap.add_argument("--device", default="cpu", help="ASR device (cpu/cuda)")
+    ap.add_argument("--device", default="auto",
+                    help="ASR device: auto (CUDA, CPU fallback), cuda, cpu")
+    ap.add_argument("--llm-url", default=None,
+                    help=f"OpenAI-compatible base URL (default {DEFAULT_LLM_URL}; "
+                         "overrides OPENAI_BASE_URL)")
+    ap.add_argument("--llm-model", default=None,
+                    help=f"model name (default {DEFAULT_LLM_MODEL}; overrides OPENAI_MODEL)")
+    ap.add_argument("--llm-key", default=None,
+                    help="API key if the endpoint needs one (overrides OPENAI_API_KEY)")
+    ap.add_argument("--max-tokens", type=int, default=120,
+                    help="LLM generation cap (short answers fit the LCD)")
+    ap.add_argument("--no-llm", action="store_true",
+                    help="skip the LLM; reply with the transcript")
+    ap.add_argument("--no-memory", action="store_true",
+                    help="disable conversation memory between queries")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -158,6 +296,25 @@ async def main() -> None:
             pass
         finally:
             log.info("client disconnected: %s", peer)
+
+    async def keep_warm():
+        """Load the model at startup, then ping it forever so it stays
+        resident (see WARM_INTERVAL_S). Failures are logged, never fatal."""
+        first = True
+        while True:
+            try:
+                t0 = time.time()
+                await loop.run_in_executor(None, pipeline.warm)
+                if first:
+                    log.info("LLM warm (%s loaded in %.1fs)",
+                             pipeline.chat_model, time.time() - t0)
+                    first = False
+            except Exception as exc:
+                log.warning("LLM keep-warm failed: %s", exc)
+            await asyncio.sleep(WARM_INTERVAL_S)
+
+    if not pipeline.echo and pipeline.chat_url:
+        asyncio.create_task(keep_warm())
 
     # max_size: an 8 s utterance is 256 KB; 1 MiB leaves ample headroom.
     async with websockets.serve(handler, "0.0.0.0", args.port,

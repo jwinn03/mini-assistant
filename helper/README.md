@@ -41,33 +41,58 @@ Set the server machine's IP in the firmware — `ASSISTANT_HELPER_IP` in
 then say "Hey Jarvis" + anything. The board should show
 `Echo: received 2.3s of audio (...)` a moment later.
 
-## Full mode (ASR, optionally + LLM)
+## Full mode (Phase 9: GPU ASR + local LLM)
+
+One-time setup:
 
 ```bash
-pip install -r requirements.txt
-python server.py                     # ASR only → replies "You said: ..."
-python server.py --whisper-model base.en   # better accuracy, slower
+pip install -r requirements.txt      # includes CUDA runtime DLLs for the GPU
+winget install Ollama.Ollama         # or the installer from ollama.com
+ollama pull llama3.2:3b              # ~2 GB; any small instruct model works
 ```
 
-First run downloads the whisper model (~75 MB for tiny.en).
-
-To relay transcripts to an LLM, point it at any OpenAI-compatible
-`/v1/chat/completions` endpoint:
+Then just:
 
 ```bash
-# Local Ollama:
-export OPENAI_BASE_URL=http://localhost:11434/v1
-export OPENAI_MODEL=llama3.2
-python server.py
-
-# Hosted API:
-export OPENAI_BASE_URL=https://api.example.com/v1
-export OPENAI_API_KEY=sk-...
-export OPENAI_MODEL=some-model
 python server.py
 ```
 
-The system prompt asks for one/two short ASCII sentences so replies fit the LCD.
+Defaults do the right thing on a CUDA machine: faster-whisper `base.en` on the
+GPU (`--device auto` falls back to CPU if CUDA fails), and transcripts are
+relayed to the local Ollama endpoint (`http://localhost:11434/v1`, model
+`llama3.2:3b`). The system prompt asks for one/two short ASCII sentences so
+replies fit the LCD.
+
+Useful variants:
+
+```bash
+python server.py --no-llm                      # ASR only → "You said: ..."
+python server.py --device cpu                  # force CPU ASR
+python server.py --whisper-model small.en      # better transcripts, still fast on GPU
+python server.py --llm-model qwen2.5:3b-instruct
+python server.py --llm-url https://api.example.com/v1 --llm-key sk-... \
+                 --llm-model some-model        # any OpenAI-compatible endpoint
+python server.py --no-memory                   # disable conversation context
+```
+
+`OPENAI_BASE_URL` / `OPENAI_MODEL` / `OPENAI_API_KEY` env vars still work; CLI
+flags take precedence.
+
+Conversation memory keeps the last 6 exchanges so follow-ups like "what about
+at sunset?" work; it resets after 5 minutes of silence.
+
+**GPU notes (RTX 5070 / Blackwell)**: ctranslate2 ≥ 4.6 ships sm_120 CUDA
+kernels, so the 5070 works with current wheels. The `nvidia-cublas-cu12` /
+`nvidia-cudnn-cu12` pip packages provide the CUDA-12-series DLLs ctranslate2
+loads — needed even if a CUDA 13 toolkit is installed system-wide (different
+DLL names).
+
+**Cold-start**: loading llama3.2:3b into VRAM measured **44 s** on this machine
+— far beyond the board's 20 s response timeout — so the server warms the model
+at startup and pings it every 4 minutes to keep it resident (Ollama would
+otherwise unload after ~5 idle minutes). A query fired in the first seconds
+after server start may still queue behind the initial load; wait for the
+`LLM warm (... loaded in ...)` log line.
 
 ## Latency budget (v1 targets)
 
@@ -103,7 +128,12 @@ The server logs per-stage timings; use them to decide what to attack first.
   `Net:` line on the Assist tab.
 - **Replies cut off with `...`**: reply exceeded the LCD area; shorten via the
   system prompt or a smaller `max_tokens`.
-- **Slow ASR**: try `--device cuda` (needs CUDA + cuDNN), or keep `tiny.en`.
+- **ASR falls back to CPU** (startup log shows `ASR init on cuda failed`):
+  check that `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` are installed in the
+  same Python environment; the warning line names the missing DLL. CPU
+  fallback still works, just slower — use `--whisper-model tiny.en` there.
+- **Replies ignore earlier context**: memory resets after 5 idle minutes, or
+  you started with `--no-memory`.
 - **Test without the board**: any WebSocket client works — send one binary
   message of PCM and print the text reply:
 

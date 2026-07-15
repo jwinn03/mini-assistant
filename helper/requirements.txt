@@ -5,5 +5,12 @@ websockets>=12
 numpy
 faster-whisper
 
-# LLM relay (only if OPENAI_BASE_URL is configured)
+# GPU ASR (Phase 9, optional): CUDA-12-series runtime DLLs for ctranslate2.
+# Needed even with a system CUDA 13 toolkit — ctranslate2 links the
+# cublas64_12 / cudnn 9 DLL names. Harmless to skip on CPU-only machines
+# (server falls back to CPU automatically with --device auto).
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+
+# LLM relay (talks to Ollama or any OpenAI-compatible endpoint)
 requests
