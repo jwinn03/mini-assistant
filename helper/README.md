@@ -17,15 +17,17 @@ Never port-forward it or bind it to a public interface. If you ever need remote
 access, put a TLS-terminating reverse proxy with auth in front of it (WSS
 support on the firmware side is future work).
 
-## Protocol (v1)
+## Protocol (v2)
 
 | Direction | Content |
 |---|---|
 | board → server | **one binary WebSocket message per utterance**: raw PCM, int16 little-endian, 16 kHz, mono (≤ 8 s ≈ 256 KB) |
-| server → board | **one text message**: the reply, plain ASCII, ideally ≤ 240 chars (the board truncates at ~275 rendered chars) |
+| server → board | **one text message** (the reply, plain ASCII, ideally ≤ 240 chars), then the spoken reply as **binary messages** (~8 KB chunks, 16 kHz mono int16 LE), then a **zero-length binary message = end-of-speech**. The EOS is always sent, even with TTS disabled. |
 
-The board keeps the connection open across utterances and reconnects once if it
-drops. Path is `/utterance` but the server accepts any path.
+Text is sent first so the board's display updates while the speech synthesizes
+and streams. The board keeps the connection open across utterances and
+reconnects once if it drops. Path is `/utterance` but the server accepts any
+path.
 
 ## Quick start (echo mode — no ML dependencies)
 
@@ -94,6 +96,27 @@ otherwise unload after ~5 idle minutes). A query fired in the first seconds
 after server start may still queue behind the initial load; wait for the
 `LLM warm (... loaded in ...)` log line.
 
+## Spoken replies (Phase 10: Piper TTS)
+
+The server speaks its replies through the board if the **Piper** binary and a
+voice are present under `helper/piper/` (gitignored — ~85 MB of binaries):
+
+```powershell
+# from helper/piper/ (create it if absent):
+#  1. piper_windows_amd64.zip from https://github.com/rhasspy/piper/releases
+#     (tag 2023.11.14-2), extracted here (gives piper/piper.exe)
+#  2. a voice pair from https://huggingface.co/rhasspy/piper-voices, e.g.
+#     en/en_US/lessac/medium/en_US-lessac-medium.onnx and .onnx.json
+```
+
+At startup the server logs `TTS ready: piper, voice ... (22050 Hz -> 16000 Hz)`
+or a warning + text-only fallback if the files are missing. `--no-tts` forces
+text-only. Voice swap = drop a different `.onnx`+`.onnx.json` pair into
+`helper/piper/` (first alphabetically wins). Piper runs on the CPU
+(faster-than-realtime), so ASR + LLM keep the GPU. Output is resampled to the
+16 kHz wire format with `soxr` and peak-normalized to -3 dBFS so playback
+level on the board is consistent across voices.
+
 ## Latency budget (v1 targets)
 
 | Stage | Typical |
@@ -124,6 +147,12 @@ The server logs per-stage timings; use them to decide what to attack first.
   Note: a loopback test on the server machine bypasses the firewall entirely,
   so it proves the server works but not that the board can reach it; check the
   board's MAC (`00-80-e1-...`) in `arp -a` to confirm L2 reachability instead.
+  **The Block rules come back**: Windows re-prompts when a python.exe with no
+  existing rule starts listening, and a dismissed prompt re-creates them. Add
+  a program-level allow for your exact interpreter so it never prompts again:
+  `netsh advfirewall firewall add rule name="Python allow (all profiles)"
+  dir=in action=allow program="C:\Python314\python.exe" profile=any`
+  — and re-do this whenever the Python install path changes (upgrades!).
 - **Board shows "No network"**: board has no DHCP lease — check cable and the
   `Net:` line on the Assist tab.
 - **Replies cut off with `...`**: reply exceeded the LCD area; shorten via the

@@ -4,6 +4,7 @@
 #include "utterance.h"
 #include "net.h"
 #include "assistant_client.h"
+#include "tts_player.h"
 #include <stdbool.h>
 #include <string.h>
 
@@ -105,6 +106,9 @@ static uint32_t s_last_seen_rejects = 0;
 static char     s_drawn_net_str[NET_STR_CAP] = { '\x01', '\0' };
 static uint16_t s_drawn_net_col     = 0xFFFE;
 
+/* Phase 10: FX-routing readout cache (part of the Caps/Rej row). */
+static uint8_t  s_drawn_fx          = 0xFF;
+
 /* Phase 8 response render cache: repaint the text area only when a new
    response lands (seq edge). */
 static uint32_t s_drawn_resp_seq    = 0xFFFFFFFFu;
@@ -178,6 +182,11 @@ static uint16_t build_state_text(char *out)
         int n = put_str(out, 0, "Capturing ");
         emit_secs(utterance_capture_ms, out + n);
         return COL_STATE_CAPTURE;
+    }
+    /* Phase 10: speech playback (FILLING counts — audio is about to start). */
+    if (tts_player_state != TTS_IDLE) {
+        put_str(out, 0, "Speaking...");
+        return COL_STATE_CAPTURE;      /* green, like the live-capture state */
     }
     switch (assistant_status) {
     case ASSIST_NO_NET:
@@ -340,16 +349,19 @@ void ui_page_assistant_redraw(void)
         s_drawn_state_col = scol;
     }
 
-    /* Captures / rejects tally. */
+    /* Captures / rejects tally + FX routing readout (tap this row to toggle). */
     {
         char m[48];
         int n = put_str(m, 0, "Caps: ");
         n += emit_u32(utterance_total_captures, m + n);
         n  = put_str(m, n, "  Rej: ");
         n += emit_u32(utterance_total_rejects, m + n);
+        n  = put_str(m, n, "  FX: ");
+        put_str(m, n, tts_player_fx_enabled ? "ON" : "OFF");
         draw_row(CAPMETA_Y, m, COL_FG);
         s_drawn_caps = utterance_total_captures;
         s_drawn_rejs = utterance_total_rejects;
+        s_drawn_fx   = tts_player_fx_enabled;
     }
 
     /* Response area (shows the last response across tab switches). */
@@ -429,16 +441,20 @@ void ui_page_assistant_tick(void)
     }
     if (s_reject_flash > 0) s_reject_flash--;
 
-    /* Captures / rejects tally — delta-only. */
-    if (utterance_total_captures != s_drawn_caps || rejs_now != s_drawn_rejs) {
+    /* Captures / rejects / FX row — delta-only. */
+    if (utterance_total_captures != s_drawn_caps || rejs_now != s_drawn_rejs ||
+        tts_player_fx_enabled != s_drawn_fx) {
         char m[48];
         int n = put_str(m, 0, "Caps: ");
         n += emit_u32(utterance_total_captures, m + n);
         n  = put_str(m, n, "  Rej: ");
         n += emit_u32(rejs_now, m + n);
+        n  = put_str(m, n, "  FX: ");
+        put_str(m, n, tts_player_fx_enabled ? "ON" : "OFF");
         draw_row(CAPMETA_Y, m, COL_FG);
         s_drawn_caps = utterance_total_captures;
         s_drawn_rejs = rejs_now;
+        s_drawn_fx   = tts_player_fx_enabled;
     }
 
     /* Response area — repaint only when a new response lands. */
@@ -489,7 +505,14 @@ void ui_page_assistant_tick(void)
 
 void ui_page_assistant_touch(uint16_t tx, uint16_t ty, bool edge)
 {
-    /* No interactive controls yet. Candidate Phase 8 polish: tap the response
-       area to clear it, or tap the net line to force a reconnect. */
-    (void)tx; (void)ty; (void)edge;
+    (void)tx;
+    if (!edge) return;
+
+    /* Phase 10: tap the Caps/Rej/FX row to toggle the TTS effects routing.
+       Generous band around the 16 px text row for finger-sized targets.
+       Takes effect immediately — even mid-speech (the inject hooks read the
+       flag per 2.67 ms block, so effects kick in/out live). */
+    if (ty >= CAPMETA_Y - 8u && ty < CAPMETA_Y + 24u) {
+        tts_player_fx_enabled = tts_player_fx_enabled ? 0u : 1u;
+    }
 }

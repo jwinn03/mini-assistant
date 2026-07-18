@@ -1,6 +1,7 @@
 claude.md
 docs/
 build/
+helper/piper/
 .vscode/
 .settings/
 .clangd

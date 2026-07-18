@@ -122,6 +122,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/net.c
     Core/Src/sha1.c
     Core/Src/assistant_client.c
+    Core/Src/tts_player.c
     Core/Src/micro_features.c
     Core/Src/feature_dump.c
     Core/Src/vad.c

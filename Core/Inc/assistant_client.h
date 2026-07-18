@@ -12,11 +12,14 @@
  * Assist tab. One persistent connection is reused across utterances, with a
  * single reconnect attempt when it has gone stale.
  *
- * Protocol (v1, matches helper/server.py):
+ * Protocol (v2, matches helper/server.py):
  *   ws://ASSISTANT_HELPER_IP:8765/utterance
  *   client → server : one binary message = one utterance (int16 LE, 16 kHz mono)
- *   server → client : one text message   = the assistant's response (ASCII)
- * Trusted-LAN only — no TLS in v1 (see helper/README.md).
+ *   server → client : one text message   = the assistant's response (ASCII),
+ *                     then Phase 10 TTS audio as binary messages (~8 KB chunks
+ *                     of 16 kHz mono int16 LE), then a zero-length binary
+ *                     message = end-of-speech (always sent, even with TTS off)
+ * Trusted-LAN only — no TLS (see helper/README.md).
  */
 
 /* ---- configuration ------------------------------------------------------ */
@@ -65,9 +68,11 @@ extern volatile uint32_t assistant_last_rtt_ms;    /* upload→response time */
 
 /* Debug (read in the debugger after a "Helper error"). assistant_dbg_step is
    the last stage reached: 1=aton 2=netconn_new 3=connect 4=write-handshake
-   5=read-response 6=validate-101 7=send-binary 8=recv-response. assistant_dbg_err
-   is the LwIP err_t from the failing call (0=ERR_OK .. -16=ERR_ARG; -100 marks a
-   non-err_t failure such as a short read or a bad 101 line). */
+   5=read-response 6=validate-101 7=send-binary 8=recv-text 9=tts-audio-stream
+   (Phase 10; failures at 9 are non-fatal — text already displayed).
+   assistant_dbg_err is the LwIP err_t from the failing call (0=ERR_OK ..
+   -16=ERR_ARG; -100 marks a non-err_t failure such as a short read or a bad
+   101 line). */
 extern volatile int32_t  assistant_dbg_step;
 extern volatile int32_t  assistant_dbg_err;
 

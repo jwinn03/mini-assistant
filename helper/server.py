@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""Reference helper server for the mini-assistant (Phase 8 transport, Phase 9 brains).
+"""Reference helper server for the mini-assistant (Phase 8 transport, Phase 9
+brains, Phase 10 voice).
 
-Protocol (v1, matches Core/Src/assistant_client.c):
+Protocol (v2, matches Core/Src/assistant_client.c):
   - WebSocket on ws://0.0.0.0:8765 (any path; the firmware uses /utterance)
   - client -> server: ONE binary message per utterance
                       (raw PCM, int16 little-endian, 16 kHz, mono)
-  - server -> client: ONE text message = the assistant's reply (ASCII, short)
+  - server -> client: ONE text message = the assistant's reply (ASCII, short),
+                      then the spoken reply as binary messages (~8 KB chunks,
+                      16 kHz mono int16 LE), then a zero-length binary message
+                      = end-of-speech. The EOS is ALWAYS sent, even with TTS
+                      disabled — the board's receive pump relies on it.
 
 Pipeline: faster-whisper ASR (CUDA with CPU fallback) -> local LLM via any
-OpenAI-compatible /v1/chat/completions endpoint (default: Ollama on localhost).
+OpenAI-compatible /v1/chat/completions endpoint (default: Ollama on localhost)
+-> Piper TTS (helper/piper/, optional — see README).
 
 Modes:
   --echo            no ASR/LLM; replies with a canned string (transport test)
@@ -26,8 +32,11 @@ LAN. Do not expose this port to the internet (see README.md).
 
 import argparse
 import asyncio
+import json
 import logging
 import os
+import pathlib
+import subprocess
 import sys
 import time
 from collections import deque
@@ -58,6 +67,12 @@ DEFAULT_LLM_MODEL = "llama3.2:3b"
 # timeout, so the first query after a break would fail with "Helper err s8".
 # A tiny generation every WARM_INTERVAL_S (< the unload window) prevents it.
 WARM_INTERVAL_S = 240.0
+
+# Phase 10 TTS (protocol v2): after the text reply, speech is streamed as
+# binary messages of TTS_CHUNK_BYTES (16 kHz mono int16 LE ~= 256 ms each),
+# terminated by a zero-length binary message (EOS). The EOS is sent even when
+# TTS is disabled or fails — the board's receive pump relies on it.
+TTS_CHUNK_BYTES = 8192
 
 
 def add_cuda_dll_dirs():
@@ -243,6 +258,71 @@ class Pipeline:
         return reply
 
 
+class TTS:
+    """Piper text-to-speech (Phase 10). Runs the piper.exe binary as a
+    subprocess per reply (`--output-raw` = raw s16le at the voice's native
+    rate on stdout), resamples to the 16 kHz wire format with soxr, and
+    peak-normalizes so the board's playback level is consistent."""
+
+    def __init__(self, args):
+        self.enabled = not args.no_tts and not args.echo
+        self.exe = None
+        self.voice = None
+        self.rate = 22050
+        if not self.enabled:
+            log.info("TTS disabled (%s)", "--echo" if args.echo else "--no-tts")
+            return
+
+        base = pathlib.Path(__file__).resolve().parent / "piper"
+        for cand in (base / "piper.exe", base / "piper" / "piper.exe"):
+            if cand.is_file():
+                self.exe = str(cand)
+                break
+        voices = sorted(base.glob("*.onnx"))
+        if voices:
+            self.voice = str(voices[0])
+
+        if not self.exe or not self.voice:
+            log.warning("TTS disabled: piper.exe / *.onnx voice not found "
+                        "under %s (see README)", base)
+            self.enabled = False
+            return
+
+        try:
+            cfg = json.loads(pathlib.Path(self.voice + ".json")
+                             .read_text(encoding="utf-8"))
+            self.rate = int(cfg["audio"]["sample_rate"])
+        except Exception:
+            log.warning("could not read %s.json - assuming %d Hz",
+                        self.voice, self.rate)
+        log.info("TTS ready: piper, voice %s (%d Hz -> %d Hz)",
+                 pathlib.Path(self.voice).name, self.rate, SAMPLE_RATE)
+
+    def synth(self, text: str) -> bytes:
+        """Blocking worker: text -> 16 kHz mono int16 LE bytes ('' on failure)."""
+        import numpy as np
+        import soxr
+
+        p = subprocess.run(
+            [self.exe, "--model", self.voice, "--output-raw"],
+            input=text.encode("utf-8"),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=30,
+            cwd=str(pathlib.Path(self.exe).parent),  # finds espeak-ng-data
+        )
+        if not p.stdout:
+            return b""
+        audio = np.frombuffer(p.stdout, dtype="<i2").astype("float32") / 32768.0
+        if self.rate != SAMPLE_RATE:
+            audio = soxr.resample(audio, self.rate, SAMPLE_RATE)
+        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+        if peak > 1e-4:
+            # Normalize to -3 dBFS-ish; cap the boost so a near-silent synth
+            # glitch can't be amplified into loud noise.
+            audio = audio * min(0.7 / peak, 4.0)
+        return (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+
+
 def sanitize(reply: str) -> str:
     """The board renders ASCII 0x20..0x7E only; keep the reply well-formed."""
     reply = reply.encode("ascii", "replace").decode("ascii")
@@ -272,11 +352,14 @@ async def main() -> None:
                     help="skip the LLM; reply with the transcript")
     ap.add_argument("--no-memory", action="store_true",
                     help="disable conversation memory between queries")
+    ap.add_argument("--no-tts", action="store_true",
+                    help="text-only replies (skip Piper speech synthesis)")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     pipeline = Pipeline(args)
+    tts = TTS(args)
     loop = asyncio.get_running_loop()
 
     async def handler(ws):
@@ -290,8 +373,24 @@ async def main() -> None:
                 reply = sanitize(
                     await loop.run_in_executor(None, pipeline.handle, msg)
                 )
-                await ws.send(reply)
+                await ws.send(reply)  # text first: display updates immediately
                 log.info("round-trip %.2fs -> %r", time.time() - t0, reply)
+
+                # Phase 10 (protocol v2): TTS audio chunks, then ALWAYS the
+                # zero-length EOS marker — the board's pump relies on it.
+                try:
+                    if tts.enabled:
+                        t1 = time.time()
+                        speech = await loop.run_in_executor(None, tts.synth, reply)
+                        for i in range(0, len(speech), TTS_CHUNK_BYTES):
+                            await ws.send(speech[i:i + TTS_CHUNK_BYTES])
+                        log.info("TTS %.2fs -> %.1fs of speech",
+                                 time.time() - t1,
+                                 len(speech) / 2 / SAMPLE_RATE)
+                except Exception as exc:
+                    log.warning("TTS failed (text already sent): %s", exc)
+                finally:
+                    await ws.send(b"")
         except websockets.ConnectionClosed:
             pass
         finally:

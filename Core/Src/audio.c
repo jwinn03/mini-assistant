@@ -4,6 +4,7 @@
 #include "recorder.h"
 #include "player.h"
 #include "decimator.h"
+#include "tts_player.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include <string.h>
@@ -42,6 +43,12 @@ static void audio_task(void *argument)
         decimator_push_stereo(src, AUDIO_HALF_FRAMES);   /* feeds wake-word path (16 kHz mono). */
         recorder_tap_pre(src, AUDIO_HALF_FRAMES);        /* no-op unless RECORDING && tap=PRE. */
 
+        /* Phase 10: FX-ON TTS replaces the mic BEFORE the chain, so the
+           response plays through the live effects. Placed after the taps so
+           the wake-word/recorder feeds never see injected audio. No-op unless
+           speaking with FX enabled (or feeding the FX tail). */
+        tts_inject_pre(src, AUDIO_HALF_FRAMES);
+
         uint32_t t0 = DWT->CYCCNT;
         process_audio(src, dst, AUDIO_HALF_SAMPLES);
         uint32_t cycles = DWT->CYCCNT - t0;
@@ -52,9 +59,12 @@ static void audio_task(void *argument)
         recorder_tap_post(dst, AUDIO_HALF_FRAMES);
 
         /* Playback injection — when PLAYING, overwrites dst with samples from
-           the SD-backed ring buffer (mic output is muted while playing back).
-           Called last so it has final say over what the codec hears. */
+           the SD-backed ring buffer (mic output is muted while playing back). */
         player_inject_post(dst, AUDIO_HALF_FRAMES);
+
+        /* Phase 10: FX-OFF TTS has final say — clean synthesized voice,
+           chain bypassed. No-op unless speaking with FX disabled. */
+        tts_inject_post(dst, AUDIO_HALF_FRAMES);
     }
 }
 

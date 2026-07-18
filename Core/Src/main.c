@@ -42,6 +42,7 @@
 #include "wake_word.h"
 #include "utterance.h"
 #include "assistant_client.h"
+#include "tts_player.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -1696,6 +1697,10 @@ void StartDefaultTask(void *argument)
      task stays last per the heap-order rule (a later xTaskCreate that runs out
      of heap_4 fails silently). */
   utterance_init();
+  /* tts_player_init() spawns the Phase 10 playback task before the assistant
+     client that feeds it. Both stay before wake_word_init() (heap-order rule:
+     wake-word remains the last xTaskCreate). */
+  tts_player_init();
   /* assistant_client_init() spawns the Phase 8 network task — the consumer of
      the utterance buffer (utterance_take/release). Needs MX_LWIP_Init (done
      above) and utterance_init; created before wake_word_init() so the

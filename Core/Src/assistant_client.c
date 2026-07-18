@@ -2,6 +2,7 @@
 #include "utterance.h"
 #include "net.h"
 #include "sha1.h"
+#include "tts_player.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -17,7 +18,7 @@
 /*
  * Hand-rolled RFC 6455 WebSocket client over LwIP's netconn API.
  *
- * Scope is deliberately v1-narrow: ws:// only (no TLS), one connection, one
+ * Scope is deliberately narrow: ws:// only (no TLS), one connection, one
  * outstanding request. The full utterance is sent as a SINGLE binary frame
  * (16-bit or 64-bit extended length) — the payload is masked straight out of
  * the pinned SDRAM capture buffer in 2 KB chunks, so no second copy of the
@@ -48,7 +49,9 @@ volatile int32_t  assistant_dbg_err      = 0;
 #define POLL_MS            50      /* utterance_state poll cadence */
 #define ERROR_HOLD_MS      3000    /* how long ASSIST_ERROR stays on screen */
 #define HS_RECV_TIMEOUT_MS 5000    /* handshake response */
-#define RESP_TIMEOUT_MS    20000   /* ASR + LLM round-trip budget */
+#define RESP_TIMEOUT_MS    20000   /* ASR + LLM round-trip budget (to TEXT) */
+#define AUDIO_MSG_TIMEOUT_MS 10000 /* Phase 10: gap between TTS messages */
+#define TTS_STALL_MS       30000   /* Phase 10: TTS ring full this long = dead */
 #define TX_CHUNK           2048    /* masking chunk (bounds our .bss buffer) */
 
 /* ---- connection state ----------------------------------------------------- */
@@ -207,71 +210,123 @@ static err_t ws_send_binary(const uint8_t *src, uint32_t n)
     return ERR_OK;
 }
 
-/* Receive one complete data message into out[cap] (NUL-terminated, non-ASCII
-   sanitized to '?'). Handles ping/pong/close control frames inline. Returns
-   the text length, or -1 on error/timeout/close. */
-static int ws_recv_msg(char *out, uint32_t cap)
+/* Message classification for the Phase 10 pump. */
+#define WSM_ERR    (-1)
+#define WSM_TEXT     1     /* text message copied into out[] */
+#define WSM_AUDIO    2     /* non-empty binary — streamed into tts_player */
+#define WSM_EOS      3     /* zero-length binary — end of speech */
+
+/* Receive ONE complete WebSocket message. Text is copied into out[cap]
+   (NUL-terminated, non-ASCII sanitized to '?'; out == NULL just skips it).
+   Binary payload is streamed straight into tts_player_write() in
+   TX_CHUNK-sized pieces — s_chunk is safe to reuse here because we never
+   transmit data frames while receiving (pongs use their own stack buffer).
+   Backpressure: while the 512 KB TTS ring is full we simply stop reading,
+   which stalls TCP flow control upstream; a TTS_STALL_MS guard bounds it.
+   Handles ping/pong/close control frames inline. */
+static int ws_recv_next(char *out, uint32_t cap)
 {
-    uint32_t used = 0;
-    bool     done = false;
+    uint32_t used      = 0;      /* text bytes accumulated */
+    uint32_t bin_total = 0;      /* binary bytes streamed */
+    uint8_t  msg_kind  = 0;      /* 0 undetermined, 1 text, 2 binary */
+    bool     done      = false;
 
     while (!done) {
         uint8_t hdr[2];
-        if (!rx_read(hdr, 2)) return -1;
+        if (!rx_read(hdr, 2)) return WSM_ERR;
 
         uint8_t  fin    = hdr[0] & 0x80u;
         uint8_t  opcode = hdr[0] & 0x0Fu;
         uint8_t  masked = hdr[1] & 0x80u;
         uint64_t plen   = hdr[1] & 0x7Fu;
 
-        if (masked) return -1;         /* server frames must be unmasked */
+        if (masked) return WSM_ERR;    /* server frames must be unmasked */
 
         if (plen == 126u) {
             uint8_t e[2];
-            if (!rx_read(e, 2)) return -1;
+            if (!rx_read(e, 2)) return WSM_ERR;
             plen = ((uint64_t)e[0] << 8) | e[1];
         } else if (plen == 127u) {
             uint8_t e[8];
-            if (!rx_read(e, 8)) return -1;
+            if (!rx_read(e, 8)) return WSM_ERR;
             plen = 0;
             for (int i = 0; i < 8; i++) plen = (plen << 8) | e[i];
         }
 
         if (opcode == 0x9u) {          /* ping → pong (echo payload) */
             uint8_t pp[125];
-            if (plen > 125u) return -1;
-            if (!rx_read(pp, (uint32_t)plen)) return -1;
-            if (ws_send_small(0xA, pp, (uint8_t)plen) != ERR_OK) return -1;
+            if (plen > 125u) return WSM_ERR;
+            if (!rx_read(pp, (uint32_t)plen)) return WSM_ERR;
+            if (ws_send_small(0xA, pp, (uint8_t)plen) != ERR_OK) return WSM_ERR;
             continue;
         }
         if (opcode == 0xAu) {          /* pong — ignore */
-            if (!rx_skip((uint32_t)plen)) return -1;
+            if (!rx_skip((uint32_t)plen)) return WSM_ERR;
             continue;
         }
         if (opcode == 0x8u) {          /* close — acknowledge and bail */
             ws_send_small(0x8, NULL, 0);
             s_ws_up = false;
-            return -1;
+            return WSM_ERR;
         }
-        /* 0x1 text / 0x2 binary / 0x0 continuation: accumulate. */
-        uint32_t want = (uint32_t)plen;
-        uint32_t room = (cap - 1u) - used;
-        uint32_t take = (want > room) ? room : want;
-        if (take > 0 && !rx_read((uint8_t *)out + used, take)) return -1;
-        used += take;
-        if (want > take && !rx_skip(want - take)) return -1;
+
+        /* Data frame. Continuations (0x0) inherit the message's first opcode. */
+        if (opcode == 0x1u)      msg_kind = 1;
+        else if (opcode == 0x2u) msg_kind = 2;
+        else if (opcode != 0x0u) return WSM_ERR;
+        if (msg_kind == 0)       return WSM_ERR;   /* continuation w/o start */
+
+        if (msg_kind == 1) {
+            uint32_t want = (uint32_t)plen;
+            uint32_t room = (out != NULL) ? (cap - 1u) - used : 0u;
+            uint32_t take = (want > room) ? room : want;
+            if (take > 0 && !rx_read((uint8_t *)out + used, take)) return WSM_ERR;
+            used += take;
+            if (want > take && !rx_skip(want - take)) return WSM_ERR;
+        } else {
+            uint64_t remaining = plen;
+            while (remaining > 0) {
+                uint32_t piece = (remaining > TX_CHUNK) ? TX_CHUNK
+                                                        : (uint32_t)remaining;
+                if (!rx_read(s_chunk, piece)) return WSM_ERR;
+
+                uint32_t   off    = 0;
+                TickType_t stall0 = xTaskGetTickCount();
+                while (off < piece) {
+                    uint32_t acc = tts_player_write(&s_chunk[off], piece - off);
+                    if (acc > 0) {
+                        off += acc;
+                        stall0 = xTaskGetTickCount();
+                    } else {
+                        if ((xTaskGetTickCount() - stall0) >
+                            pdMS_TO_TICKS(TTS_STALL_MS)) {
+                            return WSM_ERR;     /* playback wedged — bail */
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(10));
+                    }
+                }
+                remaining -= piece;
+                bin_total += piece;
+            }
+        }
         if (fin) done = true;
     }
 
-    out[used] = 0;
-    /* The LCD font is ASCII 8x16 — replace anything unprintable. Newlines
-       become spaces; the UI re-wraps by word anyway. */
-    for (uint32_t i = 0; i < used; i++) {
-        char c = out[i];
-        if (c == '\n' || c == '\r' || c == '\t') out[i] = ' ';
-        else if (c < 0x20 || c > 0x7E)           out[i] = '?';
+    if (msg_kind == 2) {
+        return (bin_total > 0) ? WSM_AUDIO : WSM_EOS;
     }
-    return (int)used;
+
+    if (out != NULL) {
+        out[used] = 0;
+        /* The LCD font is ASCII 8x16 — replace anything unprintable. Newlines
+           become spaces; the UI re-wraps by word anyway. */
+        for (uint32_t i = 0; i < used; i++) {
+            char c = out[i];
+            if (c == '\n' || c == '\r' || c == '\t') out[i] = ' ';
+            else if (c < 0x20 || c > 0x7E)           out[i] = '?';
+        }
+    }
+    return WSM_TEXT;
 }
 
 /* ---- connect + handshake --------------------------------------------------- */
@@ -406,17 +461,41 @@ static bool do_round_trip(const int16_t *pcm, uint32_t samples)
     assistant_dbg_step = 8;
     netconn_set_recvtimeout(s_conn, RESP_TIMEOUT_MS);
 
-    int rn = ws_recv_msg(assistant_response, ASSISTANT_RESPONSE_CAP);
-    if (rn < 0) {
+    /* Phase 1: the text reply. Early audio (protocol v2 is text-first, but
+       tolerate reordering) simply buffers into the TTS ring. */
+    for (;;) {
+        int t = ws_recv_next(assistant_response, ASSISTANT_RESPONSE_CAP);
+        if (t == WSM_TEXT) break;
+        if (t == WSM_AUDIO || t == WSM_EOS) continue;
         /* Timeout or protocol error — connection state is unknowable, drop it
            so the next utterance starts clean. */
+        tts_player_abort();
         conn_close();
         return false;
     }
 
+    /* Publish immediately — the display updates while the TTS streams. */
     assistant_last_rtt_ms =
         (uint32_t)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS);
     assistant_response_seq++;
+
+    /* Phase 2 (Phase 10): TTS audio chunks until the zero-length EOS marker.
+       The v2 server ALWAYS sends EOS (even with TTS disabled). Failures here
+       are non-fatal — the text is already on screen; cut the speech, drop the
+       connection, and let the next utterance reconnect. */
+    assistant_dbg_step = 9;
+    netconn_set_recvtimeout(s_conn, AUDIO_MSG_TIMEOUT_MS);
+    for (;;) {
+        int t = ws_recv_next(NULL, 0);
+        if (t == WSM_EOS) {
+            tts_player_eos();
+            break;
+        }
+        if (t == WSM_AUDIO || t == WSM_TEXT) continue;   /* stray text: ignore */
+        tts_player_abort();
+        conn_close();
+        break;
+    }
     return true;
 }
 

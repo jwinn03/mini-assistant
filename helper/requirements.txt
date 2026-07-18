@@ -14,3 +14,7 @@ nvidia-cudnn-cu12
 
 # LLM relay (talks to Ollama or any OpenAI-compatible endpoint)
 requests
+
+# TTS (Phase 10): resamples Piper's output to the 16 kHz wire format.
+# The Piper binary + voice live under helper/piper/ (see README, not pip).
+soxr

@@ -2,6 +2,7 @@
 #include "vad.h"
 #include "decimator.h"
 #include "wake_word.h"
+#include "tts_player.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include <string.h>
@@ -171,6 +172,16 @@ static void process_armed(void)
 {
     preroll_push(s_frame);
     (void)vad_is_speech(s_frame, true);          /* adapt floor while listening */
+
+    /* Phase 10 self-trigger gate: the speakers are audible to the MEMS mic,
+       so the wake model can fire on the board's own TTS voice. While playback
+       is active (plus its short tail) swallow fires with the same resync
+       idiom process_ended uses — the model keeps running, captures just
+       can't start. Barge-in is deferred (Future tasks). */
+    if (tts_player_active()) {
+        s_last_seen_fires = wake_word_total_fires;
+        return;
+    }
 
     uint32_t fires = wake_word_total_fires;
     if (fires != s_last_seen_fires) {
