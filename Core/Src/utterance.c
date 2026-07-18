@@ -27,13 +27,13 @@
 #define PREROLL_RING_MASK    (PREROLL_RING_SAMPLES - 1u)
 #define PREROLL_SAMPLES      (300u * UTT_SAMPLES_PER_MS)    /* 300 ms = 4800 */
 
-/* Hangover: keep capturing for 600 ms after the last speech-positive frame,
+/* Hangover: keep capturing for 900 ms after the last speech-positive frame,
    resetting whenever speech resumes. */
-#define HANGOVER_FRAMES      (600u / UTT_FRAME_MS)          /* 30 frames */
+#define HANGOVER_FRAMES      (900u / UTT_FRAME_MS)          /* 30 frames */
 
-/* Reject the capture if total speech is under 200 ms — almost certainly a
+/* Reject the capture if total speech is under 100 ms — almost certainly a
    spurious wake fire rather than a real command. */
-#define UTT_MIN_SPEECH_MS    200u
+#define UTT_MIN_SPEECH_MS    100u
 
 /* How long an accepted (but un-taken) capture lingers in ENDED before the
    task auto-re-arms, so standalone testing can fire repeatedly without a

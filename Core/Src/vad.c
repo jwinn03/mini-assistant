@@ -18,8 +18,8 @@
    deliberately forgiving starting point. Watch vad_last_energy on the Assist
    tab while speaking to calibrate: set OFFSET between the quiet-room energy
    and your speaking-energy. */
-#define VAD_MARGIN_NUM    3u
-#define VAD_ABS_OFFSET    5000u
+#define VAD_MARGIN_NUM    2u
+#define VAD_ABS_OFFSET    4500u
 
 /* Zero-crossing upper bound (out of VAD_FRAME_LEN-1 = 319 possible). Voiced
    and most unvoiced speech sit well under this; near-saturating broadband
