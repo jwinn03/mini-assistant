@@ -13,13 +13,14 @@
  * of the Phase 6 decimator) into a small 48 kHz staging ring. The audio task
  * injects staging frames into the codec path at one of two points:
  *
- *   FX ON  (tts_player_fx_enabled != 0): tts_inject_pre() overwrites the RX
- *          buffer BEFORE process_audio — the response plays through the live
- *          effect chain (gain -> ... -> reverb) and the mic is muted by the
- *          overwrite. After speech ends, zeros are fed through the chain for
- *          TTS_FX_TAIL_MS so delay/reverb tails decay before the mic returns.
- *   FX OFF (default): tts_inject_post() overwrites the TX buffer after every
- *          other stage — clean voice, chain bypassed.
+ *   FX ON  (default, tts_player_fx_enabled != 0): tts_inject_pre() overwrites
+ *          the RX buffer BEFORE process_audio — the response plays through the
+ *          live effect chain (gain -> ... -> reverb) and the mic is muted by
+ *          the overwrite. After speech ends, zeros are fed through the chain
+ *          for TTS_FX_TAIL_MS so delay/reverb tails decay before the mic
+ *          returns.
+ *   FX OFF: tts_inject_post() overwrites the TX buffer after every other
+ *          stage — clean voice, chain bypassed.
  *
  * Wake-word interaction: the decimator taps the raw mic before either inject
  * point, so the wake path never sees TTS digitally — but the speakers are
@@ -62,7 +63,7 @@ void tts_inject_pre(int16_t *buf, uint32_t frames);
 void tts_inject_post(int16_t *buf, uint32_t frames);
 
 /* FX routing toggle (UI writes, audio task reads). 0 = post-chain (clean),
-   nonzero = pre-chain (through the effect chain). Default 0. */
+   nonzero = pre-chain (through the effect chain). Default 1 (FX on). */
 extern volatile uint8_t  tts_player_fx_enabled;
 
 /* Diagnostics. */

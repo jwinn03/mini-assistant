@@ -77,7 +77,7 @@ static TaskHandle_t        s_task_handle;
 
 /* ===== Public state ====================================================== */
 
-volatile uint8_t  tts_player_fx_enabled = 0;    /* default: clean voice */
+volatile uint8_t  tts_player_fx_enabled = 1;    /* default: through the FX chain */
 volatile uint8_t  tts_player_state      = TTS_IDLE;
 volatile uint32_t tts_player_underruns  = 0;
 volatile uint32_t tts_player_ms_played  = 0;
