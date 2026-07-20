@@ -183,6 +183,23 @@ void lcd_draw_text(uint16_t x, uint16_t y, const char *s, uint16_t fg, uint16_t 
     }
 }
 
+void lcd_draw_toggle(uint16_t x, uint16_t y, bool on)
+{
+    uint16_t track = on ? LCD_GREEN : LCD_GRAY;
+
+    /* Track: centre slab + 2 px side columns inset by 2 px vertically —
+       reads as a rounded pill without a circle primitive. */
+    lcd_fill_rect(x + 2, y, LCD_TOGGLE_W - 4, LCD_TOGGLE_H, track);
+    lcd_fill_rect(x, y + 2, 2, LCD_TOGGLE_H - 4, track);
+    lcd_fill_rect(x + LCD_TOGGLE_W - 2, y + 2, 2, LCD_TOGGLE_H - 4, track);
+
+    /* Knob: white square, right when on, left when off. The track repaint
+       above already erased the knob's previous position. */
+    uint16_t kw = LCD_TOGGLE_H - 6;
+    uint16_t kx = on ? (uint16_t)(x + LCD_TOGGLE_W - 3 - kw) : (uint16_t)(x + 3);
+    lcd_fill_rect(kx, y + 3, kw, kw, LCD_WHITE);
+}
+
 void lcd_wait_vblank(void)
 {
     xSemaphoreTake(vblank_sem, portMAX_DELAY);

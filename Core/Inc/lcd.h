@@ -2,6 +2,7 @@
 #define LCD_H_INCLUDED
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #define LCD_W       480
 #define LCD_H       272
@@ -37,6 +38,14 @@ void lcd_clear(uint16_t color);
 void lcd_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color);
 void lcd_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg);
 void lcd_draw_text(uint16_t x, uint16_t y, const char *s, uint16_t fg, uint16_t bg);
+
+/* GUI toggle switch (pill track + sliding knob): green track / knob right
+   when on, gray track / knob left when off. Draws over whatever is beneath;
+   the 2 px corner notches are left untouched, so it looks rounded on the
+   black page background. Repainting in place handles state flips cleanly. */
+#define LCD_TOGGLE_W 44
+#define LCD_TOGGLE_H 22
+void lcd_draw_toggle(uint16_t x, uint16_t y, bool on);
 
 /* Blocks the calling task until the next LTDC VBLANK boundary.
    Use before partial framebuffer redraws to avoid tearing. */

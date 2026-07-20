@@ -6,7 +6,10 @@ Protocol (v2, matches Core/Src/assistant_client.c):
   - WebSocket on ws://0.0.0.0:8765 (any path; the firmware uses /utterance)
   - client -> server: ONE binary message per utterance
                       (raw PCM, int16 little-endian, 16 kHz, mono)
-  - server -> client: ONE text message = the assistant's reply (ASCII, short),
+  - server -> client: optionally ONE text message "Q: <transcript>" (the ASR
+                      result, sent as soon as transcription finishes so the
+                      board can display it while the LLM generates), then ONE
+                      text message = the assistant's reply (ASCII, short),
                       then the spoken reply as binary messages (~8 KB chunks,
                       16 kHz mono int16 LE), then a zero-length binary message
                       = end-of-speech. The EOS is ALWAYS sent, even with TTS
@@ -232,22 +235,21 @@ class Pipeline:
             timeout=120,  # generous: covers the initial cold load
         ).raise_for_status()
 
-    def handle(self, pcm: bytes) -> str:
-        """Blocking worker (runs in an executor thread): audio bytes -> reply."""
-        if self.echo:
-            secs = len(pcm) / 2 / SAMPLE_RATE
-            return f"Echo: received {secs:.1f}s of audio ({len(pcm)} bytes)."
-
+    def transcribe_timed(self, pcm: bytes) -> str:
+        """Blocking worker: audio bytes -> transcript ('' when unintelligible).
+        Split from respond() so the handler can push the transcript to the
+        board (the "Q: " message) while the LLM is still generating."""
         t0 = time.time()
         transcript = self.transcribe(pcm)
-        t_asr = time.time() - t0
-        log.info("ASR %.2fs: %r", t_asr, transcript)
+        log.info("ASR %.2fs: %r", time.time() - t0, transcript)
+        return transcript
+
+    def respond(self, transcript: str) -> str:
+        """Blocking worker: transcript -> reply text."""
         if not transcript:
             return "I didn't catch that."
-
         if not self.chat_url:
             return f"You said: {transcript}"
-
         t0 = time.time()
         try:
             reply = self.chat(transcript)
@@ -256,6 +258,11 @@ class Pipeline:
             return f"(LLM unavailable) You said: {transcript}"
         log.info("LLM %.2fs: %r", time.time() - t0, reply)
         return reply
+
+    def handle(self, pcm: bytes) -> str:
+        """Blocking worker for --echo mode: canned reply, no ASR/LLM."""
+        secs = len(pcm) / 2 / SAMPLE_RATE
+        return f"Echo: received {secs:.1f}s of audio ({len(pcm)} bytes)."
 
 
 class TTS:
@@ -370,10 +377,22 @@ async def main() -> None:
                 if not isinstance(msg, bytes):
                     continue  # firmware only sends binary; ignore stray text
                 t0 = time.time()
-                reply = sanitize(
-                    await loop.run_in_executor(None, pipeline.handle, msg)
-                )
-                await ws.send(reply)  # text first: display updates immediately
+                if pipeline.echo:
+                    reply = sanitize(
+                        await loop.run_in_executor(None, pipeline.handle, msg)
+                    )
+                else:
+                    transcript = await loop.run_in_executor(
+                        None, pipeline.transcribe_timed, msg)
+                    if transcript:
+                        # "Q: " message: the board shows what was heard while
+                        # the LLM is still generating the answer.
+                        await ws.send("Q: " + sanitize(transcript))
+                    reply = sanitize(
+                        await loop.run_in_executor(None, pipeline.respond,
+                                                   transcript)
+                    )
+                await ws.send(reply)  # the answer: display updates immediately
                 log.info("round-trip %.2fs -> %r", time.time() - t0, reply)
 
                 # Phase 10 (protocol v2): TTS audio chunks, then ALWAYS the

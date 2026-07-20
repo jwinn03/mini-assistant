@@ -15,7 +15,9 @@
  * Protocol (v2, matches helper/server.py):
  *   ws://ASSISTANT_HELPER_IP:8765/utterance
  *   client → server : one binary message = one utterance (int16 LE, 16 kHz mono)
- *   server → client : one text message   = the assistant's response (ASCII),
+ *   server → client : optionally one text message "Q: <transcript>" (the ASR
+ *                     result, sent as soon as transcription finishes), then
+ *                     one text message = the assistant's response (ASCII),
  *                     then Phase 10 TTS audio as binary messages (~8 KB chunks
  *                     of 16 kHz mono int16 LE), then a zero-length binary
  *                     message = end-of-speech (always sent, even with TTS off)
@@ -60,6 +62,13 @@ extern volatile uint8_t  assistant_status;         /* assistant_status_t */
    but self-heals on the next 30 Hz UI tick. */
 extern char              assistant_response[ASSISTANT_RESPONSE_CAP];
 extern volatile uint32_t assistant_response_seq;
+
+/* The ASR transcript of the user's request ("Q: " message). Cleared (with a
+   seq bump) at the start of each round-trip so a helper that doesn't send
+   transcripts (--echo) leaves the display blank rather than stale. */
+#define ASSISTANT_TRANSCRIPT_CAP 256
+extern char              assistant_transcript[ASSISTANT_TRANSCRIPT_CAP];
+extern volatile uint32_t assistant_transcript_seq;
 
 /* Diagnostics. */
 extern volatile uint32_t assistant_total_ok;       /* responses received */

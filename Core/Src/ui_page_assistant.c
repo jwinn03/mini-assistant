@@ -15,6 +15,13 @@
    deleting) keeps the code compilable and one flag away from coming back. */
 #define ASSIST_VAD_READOUT 0
 
+/* Diagnostic readouts (Caps/Rej tally + Inf/Fire/Conf line), hidden in the
+   post-Phase-10 cleanup but kept one flag away, same idiom as above. NB: the
+   layout has since been reflowed — the query rows now occupy y=96..130 where
+   the Caps/Rej text used to live, so re-enabling draws the tally at DIAG_Y
+   alongside the counters rather than at its original row. */
+#define ASSIST_DIAG_READOUT 0
+
 #if ASSIST_VAD_READOUT
 #include "vad.h"
 #endif
@@ -22,15 +29,15 @@
 /* Layout. The body region is y in [BODY_TOP, LCD_H); we just inline the same
    value (40) used elsewhere rather than expose it from ui.c.
 
-   Phase 8 rework: the wake indicator moved from centre-screen to the top-right
-   corner and the three diagnostic rows collapsed into one, freeing the middle
-   of the page for the helper-response text area:
+   Post-Phase-10 cleanup: the Caps/Rej and Inf/Fire/Conf diagnostic rows are
+   hidden (ASSIST_DIAG_READOUT), the FX switch joined the wake dot on the
+   title row, and the freed space shows the ASR transcript of the user's
+   request (blue) above the response:
 
-     44   "Assistant" title          [dot 444..460]
+     44   "Assistant" title       [FX switch 388..432][dot 444..460]
      72   state line (Listening / Capturing / Uploading / ...)
-     100  Caps/Rej tally
-     124  response rows (5 x 18 px pitch, 55 chars each)
-     224  compact diag: Inf / Fire / Conf
+     96   query rows (2 x 18 px pitch, blue — what the helper heard)
+     136  response rows (5 x 18 px pitch, 55 chars each)
      248  network status                                                   */
 #define BODY_TOP_Y         40
 #define TITLE_Y            44
@@ -43,9 +50,21 @@
 #define FLASH_TICKS        15u
 
 #define STATE_Y            72
-#define CAPMETA_Y          100
 
-#define RESP_Y0            124
+/* FX-routing switch on the title row, left of the wake dot: "FX" label +
+   graphical toggle (lcd_draw_toggle). The 22 px switch is centred on the
+   16 px title text (y offset -3). */
+#define FX_TOG_X           (INDICATOR_X - LCD_TOGGLE_W - 12)
+#define FX_TOG_Y           (TITLE_Y - 3)
+#define FX_LABEL_X         (FX_TOG_X - 2 * 8 - 6)
+
+/* Transcribed user request ("Q: " message from the helper), above the
+   response. Two wrapped rows is ample for a spoken query. */
+#define QUERY_Y0           96
+#define QUERY_ROWS         2
+#define QUERY_PITCH        18
+
+#define RESP_Y0            136
 #define RESP_PITCH         18
 #define RESP_COLS          55          /* (480 - 2*20) / 8 px per char */
 #if ASSIST_VAD_READOUT
@@ -57,7 +76,9 @@
 #endif
 
 #define DIAG_X             20
-#define DIAG_Y             224
+#if ASSIST_DIAG_READOUT
+#define DIAG_Y             228         /* between response row 5 and the net line */
+#endif
 #define NET_Y              248
 #define NET_STR_CAP        56
 
@@ -79,12 +100,19 @@
 #define COL_ASSIST_BUSY    0xFFE0          /* yellow — connecting/uploading */
 #define COL_ASSIST_WAIT    0x07FF          /* cyan   — waiting for helper */
 #define COL_ASSIST_ERR     0xF800          /* red    — round-trip failed */
+#define COL_QUERY          0x651F          /* light blue — the ASR transcript
+                                              (LCD_RGB565(100,160,255); pure
+                                              blue is too dim on black) */
 
 /* Local state — what we've already rendered, so each 33 ms tick is delta-only.
    s_drawn_* hold last-painted values; sentinels force the first draw. */
+#if ASSIST_DIAG_READOUT
 static uint32_t s_drawn_inferences = 0xFFFFFFFFu;
 static uint32_t s_drawn_fires      = 0xFFFFFFFFu;
 static int32_t  s_drawn_conf_mille = -100000;
+static uint32_t s_drawn_caps       = 0xFFFFFFFFu;
+static uint32_t s_drawn_rejs       = 0xFFFFFFFFu;
+#endif
 static bool     s_drawn_indicator_on = false;
 
 /* Flash countdown: positive == still showing the green dot. Decremented on
@@ -97,8 +125,6 @@ static uint32_t s_last_seen_fires = 0;
    only when it (or its colour) actually changes. */
 static char     s_drawn_state_str[48] = { '\x01', '\0' };  /* junk forces first draw */
 static uint16_t s_drawn_state_col   = 0xFFFE;
-static uint32_t s_drawn_caps        = 0xFFFFFFFFu;
-static uint32_t s_drawn_rejs        = 0xFFFFFFFFu;
 static uint8_t  s_reject_flash      = 0;     /* "Rejected" overlay countdown */
 static uint32_t s_last_seen_rejects = 0;
 
@@ -106,12 +132,13 @@ static uint32_t s_last_seen_rejects = 0;
 static char     s_drawn_net_str[NET_STR_CAP] = { '\x01', '\0' };
 static uint16_t s_drawn_net_col     = 0xFFFE;
 
-/* Phase 10: FX-routing readout cache (part of the Caps/Rej row). */
+/* Phase 10: FX-routing switch cache (title row). */
 static uint8_t  s_drawn_fx          = 0xFF;
 
 /* Phase 8 response render cache: repaint the text area only when a new
-   response lands (seq edge). */
+   response lands (seq edge). Same pattern for the query/transcript area. */
 static uint32_t s_drawn_resp_seq    = 0xFFFFFFFFu;
+static uint32_t s_drawn_query_seq   = 0xFFFFFFFFu;
 
 #if ASSIST_VAD_READOUT
 /* VAD tuning-aid render cache. */
@@ -266,21 +293,76 @@ static void draw_indicator(bool on)
     s_drawn_indicator_on = on;
 }
 
-/* Compose + draw the single compact diagnostics row. */
+/* "FX" label + graphical switch on the title row, left of the wake dot. */
+static void draw_fx_toggle(void)
+{
+    lcd_draw_text(FX_LABEL_X, TITLE_Y, "FX", COL_FG, COL_BG);
+    lcd_draw_toggle(FX_TOG_X, FX_TOG_Y, tts_player_fx_enabled != 0);
+    s_drawn_fx = tts_player_fx_enabled;
+}
+
+#if ASSIST_DIAG_READOUT
+/* Combined diagnostics row (hidden by default): capture tally + wake-word
+   counters on one line at DIAG_Y. The pre-cleanup UI showed these as two
+   separate rows; merged here so the dormant code needs only one row of the
+   reflowed layout. */
 static void draw_diag(void)
 {
-    char m[64];
-    int n = put_str(m, 0, "Inf: ");
+    char m[80];
+    int n = put_str(m, 0, "C:");
+    n += emit_u32(utterance_total_captures, m + n);
+    n  = put_str(m, n, " R:");
+    n += emit_u32(utterance_total_rejects, m + n);
+    n  = put_str(m, n, " Inf:");
     n += emit_u32(wake_word_total_inferences, m + n);
-    n  = put_str(m, n, "  Fire: ");
+    n  = put_str(m, n, " F:");
     n += emit_u32(wake_word_total_fires, m + n);
-    n  = put_str(m, n, "  Conf: ");
+    n  = put_str(m, n, " Cf:");
     int32_t mille = (int32_t)(wake_word_last_confidence * 1000.0f);
     emit_milli(mille, m + n);
     draw_row(DIAG_Y, m, COL_FG);
+    s_drawn_caps       = utterance_total_captures;
+    s_drawn_rejs       = utterance_total_rejects;
     s_drawn_inferences = wake_word_total_inferences;
     s_drawn_fires      = wake_word_total_fires;
     s_drawn_conf_mille = mille;
+}
+#endif
+
+/* Word-wrap the ASR transcript (what the helper heard) into the blue query
+   rows above the response. Same seq-edge pattern as draw_response. */
+static void draw_query(void)
+{
+    char txt[ASSISTANT_TRANSCRIPT_CAP];
+    strncpy(txt, assistant_transcript, sizeof(txt) - 1);
+    txt[sizeof(txt) - 1] = 0;
+
+    const char *s = txt;
+    for (int r = 0; r < QUERY_ROWS; r++) {
+        uint16_t y = (uint16_t)(QUERY_Y0 + r * QUERY_PITCH);
+        lcd_fill_rect(DIAG_X, y, 480 - DIAG_X, 16, COL_BG);
+
+        while (*s == ' ') s++;
+        if (*s == 0) continue;
+
+        int rem = (int)strlen(s);
+        int len = (rem <= RESP_COLS) ? rem : RESP_COLS;
+        if (rem > RESP_COLS) {
+            int brk = len;
+            while (brk > 0 && s[brk] != ' ') brk--;
+            if (brk > 0) len = brk;
+        }
+
+        char row[RESP_COLS + 1];
+        memcpy(row, s, (size_t)len);
+        row[len] = 0;
+        if (r == QUERY_ROWS - 1 && rem > len && len >= 3) {
+            row[len - 1] = '.'; row[len - 2] = '.'; row[len - 3] = '.';
+        }
+        lcd_draw_text(DIAG_X, y, row, COL_QUERY, COL_BG);
+        s += len;
+    }
+    s_drawn_query_seq = assistant_transcript_seq;
 }
 
 /* Word-wrap assistant_response into the response rows. Repaints the whole
@@ -327,13 +409,10 @@ static void draw_response(void)
 
 void ui_page_assistant_redraw(void)
 {
-    /* Title at the top of the body; wake indicator in the top-right corner. */
+    /* Title at the top of the body; FX switch + wake indicator top-right. */
     lcd_draw_text(DIAG_X, TITLE_Y, "Assistant", COL_TITLE, COL_BG);
 
     /* Force a full repaint of everything below the title. */
-    s_drawn_inferences   = 0xFFFFFFFFu;
-    s_drawn_fires        = 0xFFFFFFFFu;
-    s_drawn_conf_mille   = -100000;
     s_drawn_indicator_on = !s_drawn_indicator_on;   /* force draw_indicator */
 
     /* Capture state line. Don't let entering the tab spuriously flash a stale
@@ -349,22 +428,15 @@ void ui_page_assistant_redraw(void)
         s_drawn_state_col = scol;
     }
 
-    /* Captures / rejects tally + FX routing readout (tap this row to toggle). */
-    {
-        char m[48];
-        int n = put_str(m, 0, "Caps: ");
-        n += emit_u32(utterance_total_captures, m + n);
-        n  = put_str(m, n, "  Rej: ");
-        n += emit_u32(utterance_total_rejects, m + n);
-        n  = put_str(m, n, "  FX: ");
-        put_str(m, n, tts_player_fx_enabled ? "ON" : "OFF");
-        draw_row(CAPMETA_Y, m, COL_FG);
-        s_drawn_caps = utterance_total_captures;
-        s_drawn_rejs = utterance_total_rejects;
-        s_drawn_fx   = tts_player_fx_enabled;
-    }
+    /* FX routing switch (tap the title row's right end to toggle). */
+    draw_fx_toggle();
 
-    /* Response area (shows the last response across tab switches). */
+#if ASSIST_DIAG_READOUT
+    draw_diag();
+#endif
+
+    /* Query (transcript) + response areas — persist across tab switches. */
+    draw_query();
     draw_response();
 
     /* Network status line. */
@@ -393,9 +465,6 @@ void ui_page_assistant_redraw(void)
 
     draw_indicator((s_flash_remaining > 0) ||
                    (utterance_state == UTTERANCE_STATE_ACTIVE));
-
-    /* Initial diag line so the user sees something even before the first tick. */
-    draw_diag();
 }
 
 void ui_page_assistant_tick(void)
@@ -441,23 +510,15 @@ void ui_page_assistant_tick(void)
     }
     if (s_reject_flash > 0) s_reject_flash--;
 
-    /* Captures / rejects / FX row — delta-only. */
-    if (utterance_total_captures != s_drawn_caps || rejs_now != s_drawn_rejs ||
-        tts_player_fx_enabled != s_drawn_fx) {
-        char m[48];
-        int n = put_str(m, 0, "Caps: ");
-        n += emit_u32(utterance_total_captures, m + n);
-        n  = put_str(m, n, "  Rej: ");
-        n += emit_u32(rejs_now, m + n);
-        n  = put_str(m, n, "  FX: ");
-        put_str(m, n, tts_player_fx_enabled ? "ON" : "OFF");
-        draw_row(CAPMETA_Y, m, COL_FG);
-        s_drawn_caps = utterance_total_captures;
-        s_drawn_rejs = rejs_now;
-        s_drawn_fx   = tts_player_fx_enabled;
+    /* FX switch — delta-repaint on toggle. */
+    if (tts_player_fx_enabled != s_drawn_fx) {
+        draw_fx_toggle();
     }
 
-    /* Response area — repaint only when a new response lands. */
+    /* Query + response areas — repaint only on their seq edges. */
+    if (assistant_transcript_seq != s_drawn_query_seq) {
+        draw_query();
+    }
     if (assistant_response_seq != s_drawn_resp_seq) {
         draw_response();
     }
@@ -494,25 +555,30 @@ void ui_page_assistant_tick(void)
     }
 #endif
 
-    /* Compact diagnostics — delta-only on any of the three values. */
+#if ASSIST_DIAG_READOUT
+    /* Combined diagnostics — delta-only on any counter change. */
     int32_t mille = (int32_t)(wake_word_last_confidence * 1000.0f);
-    if (wake_word_total_inferences != s_drawn_inferences ||
+    if (utterance_total_captures != s_drawn_caps ||
+        rejs_now != s_drawn_rejs ||
+        wake_word_total_inferences != s_drawn_inferences ||
         fires_now != s_drawn_fires ||
         mille != s_drawn_conf_mille) {
         draw_diag();
     }
+#endif
 }
 
 void ui_page_assistant_touch(uint16_t tx, uint16_t ty, bool edge)
 {
-    (void)tx;
     if (!edge) return;
 
-    /* Phase 10: tap the Caps/Rej/FX row to toggle the TTS effects routing.
-       Generous band around the 16 px text row for finger-sized targets.
+    /* Tap the FX switch (title row, right end) to toggle the TTS effects
+       routing. Generous band around the 22 px widget for finger-sized
+       targets; X-gated so future left-side title-row controls stay free.
        Takes effect immediately — even mid-speech (the inject hooks read the
        flag per 2.67 ms block, so effects kick in/out live). */
-    if (ty >= CAPMETA_Y - 8u && ty < CAPMETA_Y + 24u) {
+    if (tx >= FX_LABEL_X - 8u && tx < INDICATOR_X - 4u &&
+        ty < TITLE_Y + 28u) {
         tts_player_fx_enabled = tts_player_fx_enabled ? 0u : 1u;
     }
 }

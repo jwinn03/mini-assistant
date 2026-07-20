@@ -38,6 +38,8 @@ volatile int32_t  assistant_init_status = 0;
 volatile uint8_t  assistant_status      = ASSIST_IDLE;
 char              assistant_response[ASSISTANT_RESPONSE_CAP];
 volatile uint32_t assistant_response_seq = 0;
+char              assistant_transcript[ASSISTANT_TRANSCRIPT_CAP];
+volatile uint32_t assistant_transcript_seq = 0;
 volatile uint32_t assistant_total_ok     = 0;
 volatile uint32_t assistant_total_errors = 0;
 volatile uint32_t assistant_last_rtt_ms  = 0;
@@ -461,11 +463,34 @@ static bool do_round_trip(const int16_t *pcm, uint32_t samples)
     assistant_dbg_step = 8;
     netconn_set_recvtimeout(s_conn, RESP_TIMEOUT_MS);
 
-    /* Phase 1: the text reply. Early audio (protocol v2 is text-first, but
-       tolerate reordering) simply buffers into the TTS ring. */
+    /* New round-trip: clear the previous transcript so a helper that sends
+       no "Q:" message (--echo mode) shows a blank query area, not a stale
+       pairing of old question with new answer. */
+    assistant_transcript[0] = 0;
+    assistant_transcript_seq++;
+
+    /* Phase 1: text until the answer arrives. A "Q: <transcript>" message
+       (the ASR result, sent while the LLM is still generating) is published
+       to the transcript buffer and the wait continues. Early audio (protocol
+       is text-first, but tolerate reordering) simply buffers into the TTS
+       ring. */
     for (;;) {
         int t = ws_recv_next(assistant_response, ASSISTANT_RESPONSE_CAP);
-        if (t == WSM_TEXT) break;
+        if (t == WSM_TEXT) {
+            if (assistant_response[0] == 'Q' && assistant_response[1] == ':' &&
+                assistant_response[2] == ' ') {
+                uint32_t i = 0;
+                while (assistant_response[3 + i] != 0 &&
+                       i < ASSISTANT_TRANSCRIPT_CAP - 1u) {
+                    assistant_transcript[i] = assistant_response[3 + i];
+                    i++;
+                }
+                assistant_transcript[i] = 0;
+                assistant_transcript_seq++;
+                continue;                /* still waiting for the answer */
+            }
+            break;                       /* the answer itself */
+        }
         if (t == WSM_AUDIO || t == WSM_EOS) continue;
         /* Timeout or protocol error — connection state is unknowable, drop it
            so the next utterance starts clean. */
@@ -563,7 +588,8 @@ void assistant_client_init(void)
         return;
     }
 
-    assistant_response[0] = 0;
+    assistant_response[0]   = 0;
+    assistant_transcript[0] = 0;
 
     /* 768 words = 3 KB. Deepest path is ws_connect (SHA-1 W[80] + locals,
        ~0.5 KB) on top of netconn API calls; the big buffers are all static. */

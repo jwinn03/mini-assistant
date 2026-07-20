@@ -15,15 +15,17 @@
 #include "task.h"
 #include <stdbool.h>
 
-/* The tab strip carries one slot per effect plus "Rec" (Phase 5
-   record/playback) and "Asst" (Phase 6 wake-word stub). Effect pages
-   0..EFFECT_COUNT-1 dispatch through the shared slider/toggle path; the two
-   higher indices delegate to their own ui_page_*_redraw/tick/touch hooks.
-   Tab width with UI_PAGE_COUNT=9 is 480/9 ≈ 53 px, still wide enough for
-   the longest label "Chorus"/"Reverb" (48 px text). */
-#define UI_PAGE_COUNT          (EFFECT_COUNT + 2)
-#define UI_PAGE_RECORD_IDX     EFFECT_COUNT
-#define UI_PAGE_ASSISTANT_IDX  (EFFECT_COUNT + 1)
+/* Four top-level tabs: Volume (the gain stage, previously the "Gain" tab),
+   Effects (a left-edge submenu selects one of the six other effects, whose
+   sliders render in the remaining area), Record and Assistant (delegated to
+   their ui_page_* modules, unchanged). 480/4 = 120 px per tab — double the
+   tap target of the old 9-tab strip. The effect page definitions themselves
+   (s_pages) are untouched; only the framing around them changed. */
+#define UI_TAB_COUNT       4
+#define UI_TAB_VOLUME      0
+#define UI_TAB_EFFECTS     1
+#define UI_TAB_RECORD      2
+#define UI_TAB_ASSISTANT   3
 
 extern I2C_HandleTypeDef hi2c3;
 
@@ -33,14 +35,22 @@ extern I2C_HandleTypeDef hi2c3;
 #define TAB_TOUCH_H        36       /* slight overshoot so finger-up at row 33 still counts */
 #define BODY_TOP           (TAB_H + 8)
 #define PAGE_NAME_Y        44
-/* Enable indicator + its touch zone live in the bottom-right corner, below
-   the slider 2 readout (which ends at y=236) and to the right of center
-   (x>=240). This avoids overlap with the slider zones and keeps the toggle
-   reachable on every page. */
-#define ENABLE_TEXT_X      (LCD_W - 3 * LCD_FONT_W - 8)
-#define ENABLE_TEXT_Y      (LCD_H - LCD_FONT_H - 4)
+/* Enable toggle switch + its touch zone live in the bottom-right corner,
+   below the slider 3 readout (which ends at y=244) and to the right of
+   center (x>=240). This avoids overlap with the slider zones and keeps the
+   toggle reachable on every effect page. */
+#define ENABLE_TOG_X       (LCD_W - LCD_TOGGLE_W - 8)
+#define ENABLE_TOG_Y       (LCD_H - LCD_TOGGLE_H - 6)
 #define ENABLE_TOUCH_TOP   (LCD_H - 28)
 #define ENABLE_TOUCH_LEFT  (LCD_W / 2)
+/* Effects-tab submenu: one entry per non-Gain effect down the left edge.
+   6 entries × 38 px fill the 232 px body almost exactly. Entries are drawn
+   like vertical tabs (same active/inactive colours as the top strip) with a
+   small green dot showing each effect's enable state at a glance. */
+#define SUBMENU_W          96
+#define SUBMENU_ITEM_H     38
+#define FX_MENU_COUNT      (EFFECT_COUNT - 1)   /* Clip..Reverb */
+#define AREA_GAP           6        /* gap between submenu and slider area */
 #define SLIDER_H           30
 #define SLIDER_LABEL_GAP   6        /* label above the bar */
 #define SLIDER_TEXT_GAP    10       /* readout below the bar */
@@ -59,9 +69,7 @@ extern I2C_HandleTypeDef hi2c3;
 #define UI_BAR_FG          LCD_CYAN
 #define UI_TEXT_FG         LCD_WHITE
 #define UI_TEXT_BG         LCD_BLACK
-#define UI_PLACEHOLDER_FG  LCD_GRAY
 #define UI_ENABLE_ON_FG    LCD_GREEN
-#define UI_ENABLE_OFF_FG   LCD_GRAY
 
 #define INVALIDATE_BAR_W   0xFFFF   /* sentinel forcing a full slider redraw */
 
@@ -309,11 +317,41 @@ static effect_page_t s_pages[EFFECT_COUNT] = {
     },
 };
 
-static uint8_t s_active_page = EFFECT_ID_GAIN;
-/* Tracks what's actually on screen for the displayed page's enable indicator,
-   so we only repaint that row when it changes. Page switch resets it via
-   page_body_redraw. */
+static uint8_t s_active_tab = UI_TAB_VOLUME;
+/* Tracks what's actually on screen for the displayed page's enable toggle,
+   so we only repaint it when it changes. Tab switch resets it via
+   tab_body_redraw. */
 static bool    s_drawn_enabled = false;
+
+/* Effects-tab submenu selection (0..FX_MENU_COUNT-1 → effect_id = sel+1).
+   Static so the tab remembers the last-viewed effect across tab switches. */
+static uint8_t s_fx_sel       = 0;              /* boot default: Clip */
+static uint8_t s_drawn_fx_sel = 0xFF;           /* forces first submenu draw */
+static bool    s_drawn_menu_en[FX_MENU_COUNT];  /* per-entry enable-dot cache */
+
+/* Active slider area (x origin + width). Volume tab: the full screen, exactly
+   the old layout. Effects tab: the region right of the submenu. Set by
+   set_area() before any slider_* call so the slider widget code stays
+   area-relative instead of assuming x=0..LCD_W. */
+static uint16_t s_area_x0 = 0;
+static uint16_t s_area_w  = LCD_W;
+
+static void set_area(void)
+{
+    if (s_active_tab == UI_TAB_EFFECTS) {
+        s_area_x0 = SUBMENU_W + AREA_GAP;
+        s_area_w  = (uint16_t)(LCD_W - (SUBMENU_W + AREA_GAP));
+    } else {
+        s_area_x0 = 0;
+        s_area_w  = LCD_W;
+    }
+}
+
+/* The effect page the Effects tab currently shows. */
+static effect_page_t *fx_page(void)
+{
+    return &s_pages[s_fx_sel + 1];
+}
 
 /* ===== Helpers =========================================================== */
 
@@ -324,28 +362,22 @@ static int strlen8(const char *s)
     return n;
 }
 
-/* Tab horizontal extents (proportional). For UI_PAGE_COUNT=8 and LCD_W=480
-   this yields uniform 60 px tabs — close enough to the original 68 px that
-   the rest of the layout is unchanged. */
+/* Tab horizontal extents (proportional): 480/4 = 120 px per tab. */
 static inline uint16_t tab_x(uint8_t i)
 {
-    return (uint16_t)((uint32_t)i * LCD_W / UI_PAGE_COUNT);
+    return (uint16_t)((uint32_t)i * LCD_W / UI_TAB_COUNT);
 }
 
 /* Hit-test the X coord to a tab index. */
 static inline uint8_t tab_hit(uint16_t x)
 {
-    uint8_t i = (uint8_t)((uint32_t)x * UI_PAGE_COUNT / LCD_W);
-    if (i >= UI_PAGE_COUNT) i = UI_PAGE_COUNT - 1;
+    uint8_t i = (uint8_t)((uint32_t)x * UI_TAB_COUNT / LCD_W);
+    if (i >= UI_TAB_COUNT) i = UI_TAB_COUNT - 1;
     return i;
 }
 
-/* Tab names. The first EFFECT_COUNT entries mirror effect_names[]; the
-   trailing "Rec" is the Phase 5 record/playback page. Kept local instead
-   of extending dsp_chain's effect_names[] (which is sized by EFFECT_COUNT
-   and indexed by effect_id_t — the record page is not an effect). */
-static const char * const s_tab_names[UI_PAGE_COUNT] = {
-    "Gain", "Clip", "FIR", "EQ", "Delay", "Chorus", "Reverb", "Rec", "Asst"
+static const char * const s_tab_names[UI_TAB_COUNT] = {
+    "Volume", "Effects", "Record", "Assistant"
 };
 
 /* Format a float to integer/1-decimal with optional sign + unit suffix.
@@ -400,13 +432,16 @@ static int format_value(float v, int8_t decimals, bool show_sign,
 
 /* ===== Slider rendering ================================================== */
 
+/* All slider geometry below is relative to the active area (s_area_x0 /
+   s_area_w): the full screen on the Volume tab, the region right of the
+   submenu on the Effects tab. */
 static uint16_t slider_bar_width(const slider_t *s)
 {
     float v = s->value;
     if (v < s->min) v = s->min;
     if (v > s->max) v = s->max;
     float t = (v - s->min) / (s->max - s->min);
-    return (uint16_t)(t * LCD_W);
+    return (uint16_t)(t * s_area_w);
 }
 
 static void slider_draw(slider_t *s)
@@ -418,19 +453,21 @@ static void slider_draw(slider_t *s)
         /* Label row — only when not compact. */
         if (!s->compact && s->label) {
             int len = strlen8(s->label);
-            int lx = (LCD_W - len * LCD_FONT_W) / 2;
-            lcd_fill_rect(0, s->label_y, LCD_W, LCD_FONT_H, UI_TEXT_BG);
+            int lx = s_area_x0 + (s_area_w - len * LCD_FONT_W) / 2;
+            lcd_fill_rect(s_area_x0, s->label_y, s_area_w, LCD_FONT_H, UI_TEXT_BG);
             lcd_draw_text(lx, s->label_y, s->label, UI_TEXT_FG, UI_TEXT_BG);
         }
         /* Bar full repaint: bg then fg */
-        lcd_fill_rect(0, s->y, LCD_W, SLIDER_H, UI_BAR_BG);
+        lcd_fill_rect(s_area_x0, s->y, s_area_w, SLIDER_H, UI_BAR_BG);
         if (bar_w > 0) {
-            lcd_fill_rect(0, s->y, bar_w, SLIDER_H, UI_BAR_FG);
+            lcd_fill_rect(s_area_x0, s->y, bar_w, SLIDER_H, UI_BAR_FG);
         }
     } else if (bar_w > s->last_bar_w) {
-        lcd_fill_rect(s->last_bar_w, s->y, bar_w - s->last_bar_w, SLIDER_H, UI_BAR_FG);
+        lcd_fill_rect(s_area_x0 + s->last_bar_w, s->y,
+                      bar_w - s->last_bar_w, SLIDER_H, UI_BAR_FG);
     } else if (bar_w < s->last_bar_w) {
-        lcd_fill_rect(bar_w, s->y, s->last_bar_w - bar_w, SLIDER_H, UI_BAR_BG);
+        lcd_fill_rect(s_area_x0 + bar_w, s->y,
+                      s->last_bar_w - bar_w, SLIDER_H, UI_BAR_BG);
     }
     s->last_bar_w = bar_w;
 
@@ -458,8 +495,8 @@ static void slider_draw(slider_t *s)
             len = format_value(s->value, s->decimals, s->show_sign, s->unit, buf);
             txt = buf;
         }
-        int tx = (LCD_W - len * LCD_FONT_W) / 2;
-        lcd_fill_rect(0, s->text_y, LCD_W, LCD_FONT_H, UI_TEXT_BG);
+        int tx = s_area_x0 + (s_area_w - len * LCD_FONT_W) / 2;
+        lcd_fill_rect(s_area_x0, s->text_y, s_area_w, LCD_FONT_H, UI_TEXT_BG);
         lcd_draw_text(tx, s->text_y, txt, UI_TEXT_FG, UI_TEXT_BG);
         s->last_value = s->value;
     }
@@ -470,7 +507,7 @@ static void slider_draw(slider_t *s)
 static void tab_draw_one(uint8_t i, bool active)
 {
     uint16_t x0 = tab_x(i);
-    uint16_t x1 = (i + 1 == UI_PAGE_COUNT) ? LCD_W : tab_x(i + 1);
+    uint16_t x1 = (i + 1 == UI_TAB_COUNT) ? LCD_W : tab_x(i + 1);
     uint16_t w  = x1 - x0;
     uint16_t bg = active ? UI_TAB_ACTIVE   : UI_TAB_INACTIVE;
     uint16_t fg = active ? UI_TAB_TEXT_ON  : UI_TAB_TEXT_OFF;
@@ -481,9 +518,8 @@ static void tab_draw_one(uint8_t i, bool active)
     if (name_len > max_chars) name_len = max_chars;
     int nx = x0 + (w - name_len * LCD_FONT_W) / 2;
     int ny = (TAB_H - LCD_FONT_H) / 2;
-    /* lcd_draw_text reads up to the null; truncating len means drawing all chars.
-       At 60 px tabs we fit 7 chars max — names cap at 6 so we're safe, but
-       the clamp keeps a future longer label from spilling into the next tab. */
+    /* 120 px tabs fit 15 chars — every label fits whole, but keep the clamp
+       so a future longer label can't spill into the next tab. */
     if (name_len == (int)strlen8(name)) {
         lcd_draw_text(nx, ny, name, fg, bg);
     } else {
@@ -495,21 +531,44 @@ static void tab_draw_one(uint8_t i, bool active)
 
 static void tabs_draw_all(uint8_t active)
 {
-    for (uint8_t i = 0; i < UI_PAGE_COUNT; i++) {
+    for (uint8_t i = 0; i < UI_TAB_COUNT; i++) {
         tab_draw_one(i, i == active);
     }
 }
 
-/* ===== Enable indicator ================================================== */
+/* ===== Enable toggle ===================================================== */
 
 static void enable_indicator_draw(bool enabled)
 {
-    const char *txt = enabled ? "ON " : "OFF";
-    uint16_t fg = enabled ? UI_ENABLE_ON_FG : UI_ENABLE_OFF_FG;
-    /* Repaint just the indicator's 3-char strip to avoid touching the page
-       name to its left. */
-    lcd_fill_rect(ENABLE_TEXT_X, ENABLE_TEXT_Y, 3 * LCD_FONT_W, LCD_FONT_H, UI_TEXT_BG);
-    lcd_draw_text(ENABLE_TEXT_X, ENABLE_TEXT_Y, txt, fg, UI_TEXT_BG);
+    lcd_draw_toggle(ENABLE_TOG_X, ENABLE_TOG_Y, enabled);
+}
+
+/* ===== Effects submenu =================================================== */
+
+static void submenu_item_draw(uint8_t i, bool selected)
+{
+    uint16_t y0 = (uint16_t)(BODY_TOP + i * SUBMENU_ITEM_H);
+    uint16_t bg = selected ? UI_TAB_ACTIVE  : UI_TAB_INACTIVE;
+    uint16_t fg = selected ? UI_TAB_TEXT_ON : UI_TAB_TEXT_OFF;
+
+    lcd_fill_rect(0, y0, SUBMENU_W, SUBMENU_ITEM_H - 2, bg);
+    lcd_draw_text(6, y0 + (SUBMENU_ITEM_H - 2 - LCD_FONT_H) / 2,
+                  effect_names[i + 1], fg, bg);
+
+    /* Enable-state dot at the right edge: green when the effect is in the
+       chain, background-coloured (invisible) when bypassed. */
+    bool en = dsp_chain_get_enabled((uint8_t)(i + 1));
+    lcd_fill_rect(SUBMENU_W - 16, y0 + (SUBMENU_ITEM_H - 2) / 2 - 4, 8, 8,
+                  en ? UI_ENABLE_ON_FG : bg);
+    s_drawn_menu_en[i] = en;
+}
+
+static void submenu_draw_all(void)
+{
+    for (uint8_t i = 0; i < FX_MENU_COUNT; i++) {
+        submenu_item_draw(i, i == s_fx_sel);
+    }
+    s_drawn_fx_sel = s_fx_sel;
 }
 
 /* ===== Page body ========================================================= */
@@ -522,49 +581,60 @@ static void page_invalidate(effect_page_t *p)
     }
 }
 
-static void page_body_redraw(effect_page_t *p)
+/* Draw an effect page's static furniture into the current slider area (no
+   wipe — callers clear the region first): centered title, enable toggle,
+   and slider invalidation so the next tick repaints them. `title` is the
+   tab/submenu-facing name ("Volume" for the gain page). */
+static void effect_content_draw(effect_page_t *p, const char *title)
 {
-    /* Clear body region. ~480 x 232 = 111360 px x 2 B = ~222 KB. This bursts
-       through the SDRAM frame buffer once on a page change — outside the
-       VBLANK budget, so brief tearing during a page switch is expected. */
-    lcd_fill_rect(0, BODY_TOP, LCD_W, LCD_H - BODY_TOP, UI_TEXT_BG);
+    int len = strlen8(title);
+    int nx = s_area_x0 + (s_area_w - len * LCD_FONT_W) / 2;
+    lcd_draw_text(nx, PAGE_NAME_Y, title, UI_TEXT_FG, UI_TEXT_BG);
 
-    /* Page name centered */
-    int len = strlen8(p->name);
-    int nx = (LCD_W - len * LCD_FONT_W) / 2;
-    lcd_draw_text(nx, PAGE_NAME_Y, p->name, UI_TEXT_FG, UI_TEXT_BG);
-
-    /* Enable indicator on the right of the header row */
     bool en = dsp_chain_get_enabled(p->effect_id);
     enable_indicator_draw(en);
     s_drawn_enabled = en;
 
-    if (p->slider_count == 0) {
-        const char *msg = "(not implemented)";
-        int mlen = strlen8(msg);
-        int mx = (LCD_W - mlen * LCD_FONT_W) / 2;
-        int my = (LCD_H + BODY_TOP) / 2 - LCD_FONT_H / 2;
-        lcd_draw_text(mx, my, msg, UI_PLACEHOLDER_FG, UI_TEXT_BG);
-    }
-
     page_invalidate(p);
 }
 
-/* Record-page body repaint: clear the same body region as effect pages,
-   then let ui_page_record paint its own layout. Kept here instead of inside
-   ui_page_record_redraw so the body-clear cost is paid uniformly across
-   all page switches. */
-static void record_page_body_redraw(void)
+/* Full body repaint for the active tab. ~480 x 232 px wipe bursts through
+   the SDRAM frame buffer — outside the VBLANK budget, so brief tearing on a
+   tab switch is expected (rare, user-initiated). */
+static void tab_body_redraw(void)
 {
     lcd_fill_rect(0, BODY_TOP, LCD_W, LCD_H - BODY_TOP, UI_TEXT_BG);
-    ui_page_record_redraw();
+    set_area();
+    switch (s_active_tab) {
+    case UI_TAB_VOLUME:
+        effect_content_draw(&s_pages[EFFECT_ID_GAIN], "Volume");
+        break;
+    case UI_TAB_EFFECTS:
+        submenu_draw_all();
+        effect_content_draw(fx_page(), fx_page()->name);
+        break;
+    case UI_TAB_RECORD:
+        ui_page_record_redraw();
+        break;
+    default:
+        ui_page_assistant_redraw();
+        break;
+    }
 }
 
-/* Same pattern for the assistant page. */
-static void assistant_page_body_redraw(void)
+/* Submenu selection changed within the Effects tab: restyle the two menu
+   entries and repaint only the content area right of the submenu. */
+static void effects_content_switch(void)
 {
-    lcd_fill_rect(0, BODY_TOP, LCD_W, LCD_H - BODY_TOP, UI_TEXT_BG);
-    ui_page_assistant_redraw();
+    if (s_drawn_fx_sel != 0xFF && s_drawn_fx_sel != s_fx_sel) {
+        submenu_item_draw(s_drawn_fx_sel, false);
+    }
+    submenu_item_draw(s_fx_sel, true);
+    s_drawn_fx_sel = s_fx_sel;
+
+    lcd_fill_rect(SUBMENU_W, BODY_TOP, LCD_W - SUBMENU_W, LCD_H - BODY_TOP,
+                  UI_TEXT_BG);
+    effect_content_draw(fx_page(), fx_page()->name);
 }
 
 /* ===== Touch dispatch ==================================================== */
@@ -586,7 +656,7 @@ static int8_t hit_slider(effect_page_t *p, uint16_t y)
 
 static void slider_drag_to(slider_t *s, uint16_t tx)
 {
-    float t = (float)tx / (float)LCD_W;
+    float t = (float)((int)tx - (int)s_area_x0) / (float)s_area_w;
     if (t < 0.0f) t = 0.0f;
     if (t > 1.0f) t = 1.0f;
     float v = t * (s->max - s->min) + s->min;
@@ -607,18 +677,12 @@ static void ui_task(void *arg)
         vTaskDelete(NULL);
     }
 
-    /* Initial paint — both tab strip and active page body. */
-    tabs_draw_all(s_active_page);
-    if (s_active_page < EFFECT_COUNT) {
-        page_body_redraw(&s_pages[s_active_page]);
-    } else if (s_active_page == UI_PAGE_RECORD_IDX) {
-        record_page_body_redraw();
-    } else {
-        assistant_page_body_redraw();
-    }
+    /* Initial paint — both tab strip and active tab body. */
+    tabs_draw_all(s_active_tab);
+    tab_body_redraw();
 
-    bool    prev_touch       = false;
-    uint8_t displayed_page   = s_active_page;
+    bool    prev_touch    = false;
+    uint8_t displayed_tab = s_active_tab;
 
     TickType_t last_wake = xTaskGetTickCount();
     for (;;) {
@@ -629,36 +693,51 @@ static void ui_task(void *arg)
         bool edge      = (now_touch && !prev_touch);
 
         /* Tab selection — edge-triggered on touch press inside the tab strip.
-           Re-checking each frame would let a held finger flip pages repeatedly. */
+           Re-checking each frame would let a held finger flip tabs repeatedly. */
         if (edge && ty < TAB_TOUCH_H) {
             uint8_t hit = tab_hit(tx);
-            if (hit != s_active_page) {
-                s_active_page = hit;
+            if (hit != s_active_tab) {
+                s_active_tab = hit;
             }
         }
 
-        if (s_active_page < EFFECT_COUNT) {
-            /* Effect page: enable toggle + slider drag, as before. */
-            if (edge && tx >= ENABLE_TOUCH_LEFT && ty >= ENABLE_TOUCH_TOP) {
-                bool en = dsp_chain_get_enabled(s_active_page);
-                dsp_chain_set_enabled(s_active_page, !en);
+        if (s_active_tab == UI_TAB_VOLUME || s_active_tab == UI_TAB_EFFECTS) {
+            set_area();
+            effect_page_t *p = (s_active_tab == UI_TAB_VOLUME)
+                                   ? &s_pages[EFFECT_ID_GAIN] : fx_page();
+
+            /* Submenu selection (Effects tab): edge-tap in the left column. */
+            if (s_active_tab == UI_TAB_EFFECTS && edge &&
+                tx < SUBMENU_W && ty >= BODY_TOP) {
+                uint8_t item = (uint8_t)((ty - BODY_TOP) / SUBMENU_ITEM_H);
+                if (item < FX_MENU_COUNT) {
+                    s_fx_sel = item;
+                }
             }
 
+            /* Enable toggle: bottom-right corner tap. */
+            if (edge && tx >= ENABLE_TOUCH_LEFT && ty >= ENABLE_TOUCH_TOP) {
+                bool en = dsp_chain_get_enabled(p->effect_id);
+                dsp_chain_set_enabled(p->effect_id, !en);
+            }
+
+            /* Slider drag — only inside the slider area (right of the
+               submenu on the Effects tab) and outside the toggle corner. */
             bool in_toggle_corner =
                 (tx >= ENABLE_TOUCH_LEFT && ty >= ENABLE_TOUCH_TOP);
-            if (now_touch && ty >= BODY_TOP && !in_toggle_corner) {
-                effect_page_t *p = &s_pages[s_active_page];
+            if (now_touch && ty >= BODY_TOP && tx >= s_area_x0 &&
+                !in_toggle_corner) {
                 int8_t si = hit_slider(p, ty);
                 if (si >= 0) {
                     slider_drag_to(&p->sliders[si], tx);
                 }
             }
-        } else if (s_active_page == UI_PAGE_RECORD_IDX) {
+        } else if (s_active_tab == UI_TAB_RECORD) {
             /* Record page: delegate to its hit-test. */
             if (now_touch && ty >= BODY_TOP) {
                 ui_page_record_touch(tx, ty, edge);
             }
-        } else if (s_active_page == UI_PAGE_ASSISTANT_IDX) {
+        } else {
             if (now_touch && ty >= BODY_TOP) {
                 ui_page_assistant_touch(tx, ty, edge);
             }
@@ -666,37 +745,51 @@ static void ui_task(void *arg)
 
         prev_touch = now_touch;
 
-        /* Sync rendering to VBLANK. Even page switches happen here — the
+        /* Sync rendering to VBLANK. Even tab switches happen here — the
            full-body wipe overruns the blanking window, briefly tearing,
-           but page switches are rare/user-initiated so we accept it. */
+           but tab switches are rare/user-initiated so we accept it. */
         lcd_wait_vblank();
 
-        if (s_active_page != displayed_page) {
-            tab_draw_one(displayed_page, false);
-            tab_draw_one(s_active_page,  true);
-            if (s_active_page < EFFECT_COUNT) {
-                page_body_redraw(&s_pages[s_active_page]);
-            } else if (s_active_page == UI_PAGE_RECORD_IDX) {
-                record_page_body_redraw();
-            } else {
-                assistant_page_body_redraw();
-            }
-            displayed_page = s_active_page;
-        } else if (displayed_page < EFFECT_COUNT) {
-            /* Effect page on the same page — repaint enable indicator on change. */
-            bool en = dsp_chain_get_enabled(displayed_page);
+        if (s_active_tab != displayed_tab) {
+            tab_draw_one(displayed_tab, false);
+            tab_draw_one(s_active_tab,  true);
+            tab_body_redraw();
+            displayed_tab = s_active_tab;
+        } else if (displayed_tab == UI_TAB_EFFECTS &&
+                   s_fx_sel != s_drawn_fx_sel) {
+            /* Submenu selection changed — partial repaint, same tab. */
+            set_area();
+            effects_content_switch();
+        }
+
+        if (displayed_tab == UI_TAB_VOLUME || displayed_tab == UI_TAB_EFFECTS) {
+            set_area();
+            effect_page_t *p = (displayed_tab == UI_TAB_VOLUME)
+                                   ? &s_pages[EFFECT_ID_GAIN] : fx_page();
+
+            /* Enable toggle — repaint on change. */
+            bool en = dsp_chain_get_enabled(p->effect_id);
             if (en != s_drawn_enabled) {
                 enable_indicator_draw(en);
                 s_drawn_enabled = en;
             }
-        }
 
-        if (displayed_page < EFFECT_COUNT) {
-            effect_page_t *p = &s_pages[displayed_page];
             for (uint8_t i = 0; i < p->slider_count; i++) {
                 slider_draw(&p->sliders[i]);
             }
-        } else if (displayed_page == UI_PAGE_RECORD_IDX) {
+
+            /* Submenu enable dots — delta-repaint entries whose effect was
+               toggled (the current page's toggle is the only writer today,
+               but the check is cheap and future-proof). */
+            if (displayed_tab == UI_TAB_EFFECTS) {
+                for (uint8_t i = 0; i < FX_MENU_COUNT; i++) {
+                    bool e2 = dsp_chain_get_enabled((uint8_t)(i + 1));
+                    if (e2 != s_drawn_menu_en[i]) {
+                        submenu_item_draw(i, i == s_drawn_fx_sel);
+                    }
+                }
+            }
+        } else if (displayed_tab == UI_TAB_RECORD) {
             ui_page_record_tick();
         } else {
             ui_page_assistant_tick();

@@ -22,7 +22,7 @@ support on the firmware side is future work).
 | Direction | Content |
 |---|---|
 | board → server | **one binary WebSocket message per utterance**: raw PCM, int16 little-endian, 16 kHz, mono (≤ 8 s ≈ 256 KB) |
-| server → board | **one text message** (the reply, plain ASCII, ideally ≤ 240 chars), then the spoken reply as **binary messages** (~8 KB chunks, 16 kHz mono int16 LE), then a **zero-length binary message = end-of-speech**. The EOS is always sent, even with TTS disabled. |
+| server → board | optionally **one text message `Q: <transcript>`** (the ASR result, sent as soon as transcription finishes — the board shows it in blue while the LLM generates), then **one text message** (the reply, plain ASCII, ideally ≤ 240 chars), then the spoken reply as **binary messages** (~8 KB chunks, 16 kHz mono int16 LE), then a **zero-length binary message = end-of-speech**. The EOS is always sent, even with TTS disabled. |
 
 Text is sent first so the board's display updates while the speech synthesizes
 and streams. The board keeps the connection open across utterances and
